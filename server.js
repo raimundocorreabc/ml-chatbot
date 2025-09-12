@@ -13,7 +13,7 @@ const {
   PORT,
 
   // Config FAQs
-  FREE_SHIPPING_THRESHOLD_CLP, // si no está, usamos 40000 (RM)
+  FREE_SHIPPING_THRESHOLD_CLP, // default 40000 (RM)
   MUNDOPUNTOS_EARN_PER_CLP,
   MUNDOPUNTOS_REDEEM_PER_100,
   MUNDOPUNTOS_PAGE_URL
@@ -137,6 +137,23 @@ async function searchByVendor(vendor, first = 5) {
   return items;
 }
 
+// Multi-búsqueda incremental hasta completar max ítems
+async function searchMulti(queries = [], max = 5) {
+  const picks = [];
+  const seen = new Set();
+  for (const q of queries) {
+    const found = await searchProductsPlain(q, 3);
+    for (const it of found) {
+      if (!seen.has(it.handle)) {
+        seen.add(it.handle);
+        picks.push(it);
+        if (picks.length >= max) return picks;
+      }
+    }
+  }
+  return picks;
+}
+
 /* ---------------- Tools de IA ---------------- */
 const tools = [
   {
@@ -176,7 +193,7 @@ const tools = [
   }
 ];
 
-/* ---------------- Helpers ---------------- */
+/* ---------------- Helpers texto/productos ---------------- */
 function buildProductsMarkdown(items = []) {
   if (!items.length) return null;
   const lines = items.map((p, i) => {
@@ -193,7 +210,19 @@ function stripAndTrim(s = '') {
     .trim();
 }
 
-/* ==================== PATCH 1: Helpers nuevos ==================== */
+// TIP de saludo + progreso a envío gratis (si aplica)
+function maybePrependGreetingTip(text, meta, FREE_TH) {
+  const name = (meta?.userFirstName || '').trim();
+  if (!name) return text;
+  let extra = '';
+  const sub = meta?.cartSubtotalCLP;
+  if (sub != null && Number.isFinite(sub) && FREE_TH > 0 && sub < FREE_TH) {
+    extra = ` | Te faltan ${formatCLP(FREE_TH - sub)} para envío gratis en RM`;
+  }
+  return `TIP: Hola, ${name} 👋${extra ? ' ' + extra : ''}\n\n${text}`;
+}
+
+/* ==================== Helpers de TIPs temáticos ==================== */
 
 // LISTAR MARCAS (vendors)
 async function listVendors(limit = 20) {
@@ -249,7 +278,7 @@ async function recommendZoneProducts(zones = []) {
   return picks;
 }
 
-// “OLLA QUEMADA” (TIP + productos)
+// OLLA QUEMADA (TIP + productos)
 async function tipOllaQuemada() {
   const tip = [
     'TIP: Para **olla quemada**:',
@@ -264,12 +293,26 @@ async function tipOllaQuemada() {
     'astonish vitroceramica kit',
     'weiman acero inoxidable 710'
   ];
-  const items = [];
-  for (const q of want) {
-    const r = await searchProductsPlain(q, 1);
-    if (r.length) items.push(r[0]);
-  }
+  const items = await searchMulti(want, 3);
+  const list = buildProductsMarkdown(items);
+  return list ? `${tip}\n\n${list}` : tip;
+}
 
+// SILLÓN / TAPIZ (TIP + productos)
+async function tipSillon() {
+  const tip = [
+    'TIP: Para **sillón/tapiz**:',
+    '1) Aspira bien (boquilla de tapiz).',
+    '2) Prueba el producto en zona oculta.',
+    '3) Aplica limpiador de telas, frota suave con microfibra, retira y deja ventilar.',
+    '4) Opcional: **protector textil** anti manchas.'
+  ].join(' ');
+  const want = [
+    'limpiador tela sofa',
+    'protector textil',
+    'quitamanchas tapiz'
+  ];
+  const items = await searchMulti(want, 3);
   const list = buildProductsMarkdown(items);
   return list ? `${tip}\n\n${list}` : tip;
 }
@@ -284,7 +327,8 @@ function detectIntent(text = '') {
     'para que sirve','como usar','instrucciones','modo de uso','ingredientes','composicion',
     'sirve para','usos','beneficios','caracteristicas','como puedo','como sacar','como limpiar',
     'consejos','tips','que es','envio','despacho','retiro','gratis','costo de envio','envio gratis',
-    'mundopuntos','puntos','fidelizacion','checkout','cupon','codigo de descuento'
+    'mundopuntos','puntos','fidelizacion','checkout','cupon','codigo de descuento',
+    'marcas venden','tipos de productos','que productos venden','que venden'
   ];
   const buyTriggers = ['comprar','agrega','agregar','añade','añadir','carrito','precio','recomiend'];
 
@@ -294,8 +338,8 @@ function detectIntent(text = '') {
   return 'browse';
 }
 
-/* ==================== PATCH 2: FAQ async con nuevas rutas ==================== */
-async function faqAnswerOrNull(message = '') {
+/* ==================== FAQ/guías (async) ==================== */
+async function faqAnswerOrNull(message = '', meta = {}) {
   const raw = (message || '').trim();
   const qFold = fold(raw);
 
@@ -307,7 +351,12 @@ async function faqAnswerOrNull(message = '') {
   if (REGIONES_FOLDED.has(qFold)) {
     const isRM = /metropolitana|santiago/.test(qFold);
     const rmExtra = isRM && freeStrRM ? ` En RM, ${freeStrRM}.` : '';
-    return `Hacemos despacho a **todo Chile**.${rmExtra} Para regiones, el costo se calcula en el checkout según **región y comuna** y peso. Frecuencias por zona: ${destinosUrl}`;
+    let line = `Hacemos despacho a **todo Chile**.${rmExtra} Para regiones, el costo se calcula en el checkout según **región y comuna** y peso. Frecuencias por zona: ${destinosUrl}`;
+    // Progreso a envío gratis si tenemos subtotal
+    if (isRM && meta?.cartSubtotalCLP != null && FREE_TH > 0 && meta.cartSubtotalCLP < FREE_TH) {
+      line = `TIP: Te faltan **${formatCLP(FREE_TH - meta.cartSubtotalCLP)}** para envío gratis en RM.\n\n${line}`;
+    }
+    return line;
   }
 
   // Comuna sola
@@ -315,17 +364,23 @@ async function faqAnswerOrNull(message = '') {
     const idx = COMUNAS.findIndex(c => fold(c) === qFold);
     const comunaNice = idx >= 0 ? titleCaseComuna(COMUNAS[idx]) : titleCaseComuna(raw);
     const rmHint = freeStrRM ? ` En RM, ${freeStrRM}.` : '';
-    return `Hacemos despacho a **todo Chile**.${rmHint} Para **${comunaNice}**, el costo se calcula en el checkout al ingresar **región y comuna**. Frecuencias por zona: ${destinosUrl}`;
+    let line = `Hacemos despacho a **todo Chile**.${rmHint} Para **${comunaNice}**, el costo se calcula en el checkout al ingresar **región y comuna**. Frecuencias por zona: ${destinosUrl}`;
+    if (meta?.cartSubtotalCLP != null && FREE_TH > 0 && meta.cartSubtotalCLP < FREE_TH) {
+      line = `TIP: Te faltan **${formatCLP(FREE_TH - meta.cartSubtotalCLP)}** para envío gratis en RM.\n\n${line}`;
+    }
+    return line;
   }
 
   // ENVÍOS genérico
   if (/(env[ií]o|envio|despacho|retiro)/i.test(raw)) {
     const base = `Hacemos despacho a **todo Chile**.`;
+    const progress = (meta?.cartSubtotalCLP != null && FREE_TH > 0 && meta.cartSubtotalCLP < FREE_TH)
+      ? `TIP: Te faltan **${formatCLP(FREE_TH - meta.cartSubtotalCLP)}** para envío gratis en RM.\n\n` : '';
     if (/gratis|m[ií]nimo|minimo|sobre cu[aá]nto/i.test(raw)) {
-      if (freeStrRM) return `${base} En **RM** ofrecemos ${freeStrRM}. Bajo ese monto, y para **regiones**, el costo se calcula en checkout según **región/comuna** y peso. ¿Para qué **región y comuna** lo necesitas? Frecuencias: ${destinosUrl}`;
-      return `${base} El costo se calcula en checkout según **región/comuna** y peso. ¿Para qué **región y comuna** lo necesitas? Frecuencias: ${destinosUrl}`;
+      if (freeStrRM) return `${progress}${base} En **RM** ofrecemos ${freeStrRM}. Bajo ese monto, y para **regiones**, el costo se calcula en checkout según **región/comuna** y peso. ¿Para qué **región y comuna** lo necesitas? Frecuencias: ${destinosUrl}`;
+      return `${progress}${base} El costo se calcula en checkout según **región/comuna** y peso. ¿Para qué **región y comuna** lo necesitas? Frecuencias: ${destinosUrl}`;
     }
-    return `${base} El costo y tiempos dependen de **región/comuna** y peso. En el checkout verás las opciones disponibles. ¿Para qué **región y comuna**? Frecuencias: ${destinosUrl}`;
+    return `${progress}${base} El costo y tiempos dependen de **región/comuna** y peso. En el checkout verás las opciones disponibles. ¿Para qué **región y comuna**? Frecuencias: ${destinosUrl}`;
   }
 
   // ¿Dónde canjear cupón en checkout?
@@ -337,9 +392,13 @@ async function faqAnswerOrNull(message = '') {
     ].join(' ');
   }
 
-  // ¿Qué es Mundo Limpio?
-  if (/(que es|qué es|quienes son|quiénes son).*(mundolimpio|mundo limpio)/i.test(raw)) {
-    return `**MundoLimpio.cl** es una tienda chilena de productos de limpieza y hogar premium. Importamos y distribuimos marcas como **Astonish, Weiman, Goo Gone, Wright’s, 30 Seconds, JAWS**, entre otras, con foco en asesoría y soluciones reales para el hogar.`;
+  // ¿Qué es Mundo Limpio? / ¿Qué venden?
+  if (/(que es|qué es|quienes son|quiénes son).*(mundolimpio|mundo limpio)|que venden en mundolimpio|que productos venden\??$/i.test(raw)) {
+    const cols = await listCollections(8);
+    const about = `**MundoLimpio.cl** es una tienda chilena de limpieza/hogar premium. Marcas como **Astonish, Weiman, Goo Gone, Wright’s, 30 Seconds, JAWS**, entre otras.`;
+    if (!cols.length) return about;
+    const lines = cols.map(c => `- [${c.title}](${BASE}/collections/${c.handle})`).join('\n');
+    return `${about}\n\nEstas son algunas categorías:\n\n${lines}`;
   }
 
   // ¿Qué MARCAS venden?
@@ -357,10 +416,31 @@ async function faqAnswerOrNull(message = '') {
     return `Estas son algunas categorías:\n\n${lines}`;
   }
 
-  // OLLA QUEMADA (guía + productos)
-  if (/olla.*quemad/i.test(qFold)) {
-    return await tipOllaQuemada();
+  // Pet food fuera de categoría
+  if (/(comida|alimento).*(perr|gat)/i.test(raw)) {
+    return 'Por ahora no vendemos alimentos para mascotas 🐶🐱. Si buscas **control de olores** o **limpieza** para mascotas, te puedo sugerir productos específicos.';
   }
+
+  // HONGOS interior/exterior
+  if (/hongo|moho/i.test(raw)) {
+    if (/interior|dentro|ba[nñ]o|ducha|tina|muro|pared/i.test(raw)) {
+      const items = await searchMulti(['antihongos baño', 'antihongos interior', 'moho ducha'], 5);
+      const list = buildProductsMarkdown(items);
+      const tip = 'TIP: Para **interior**: ventila, usa guantes, aplica **antihongos**, deja actuar 5–10 min, cepilla y enjuaga. Repite si es necesario.';
+      return list ? `${tip}\n\n${list}` : tip;
+    } else if (/exterior|patio|fachada|techo|terraza|madera exterior/i.test(raw)) {
+      const items = await searchMulti(['30 seconds moho', 'antihongos exterior'], 5);
+      const list = buildProductsMarkdown(items);
+      const tip = 'TIP: Para **exterior**: aplica el limpiador en superficie **seca**, deja actuar y enjuaga con manguera. Protege plantas cercanas.';
+      return list ? `${tip}\n\n${list}` : tip;
+    }
+  }
+
+  // OLLA QUEMADA
+  if (/olla.*quemad/i.test(qFold)) return await tipOllaQuemada();
+
+  // SILLÓN / TAPIZ
+  if (/sill[oó]n|sofa|sof[aá]|tapiz/i.test(qFold)) return await tipSillon();
 
   // MUNDOPUNTOS (sin link si no hay página)
   if (/mundopuntos|puntos|fidelizaci[óo]n/i.test(raw)) {
@@ -378,7 +458,7 @@ async function faqAnswerOrNull(message = '') {
     return parts.join(' ');
   }
 
-  // HONGOS / MOHO EN BAÑO
+  // HONGOS / MOHO (genérico)
   if (/(hongo|moho).*(baño|ducha|tina)|sacar los hongos|sacar hongos/i.test(raw)) {
     return [
       `Para **hongos/moho en el baño**:`,
@@ -396,13 +476,11 @@ async function faqAnswerOrNull(message = '') {
 function synonymQueryOrNull(message='') {
   const q = norm(message);
   // Pink Stuff (pasta rosada)
-  if (/pasta.*(rosada|pink)|pink.*stuff/.test(q)) {
-    return 'pink stuff pasta multiuso stardrops';
-  }
+  if (/pasta.*(rosada|pink)|pink.*stuff/.test(q)) return 'pink stuff pasta multiuso stardrops';
   // Astonish (pasta original)
-  if (/pasta.*(original|astonish)|astonish.*pasta/.test(q)) {
-    return 'astonish pasta original multiuso';
-  }
+  if (/pasta.*(original|astonish)|astonish.*pasta/.test(q)) return 'astonish pasta original multiuso';
+  // Eco
+  if (/ecolog|eco|biodegrad/i.test(q)) return 'ecologico biodegradable eco plant-based';
   return null;
 }
 
@@ -423,7 +501,9 @@ function isAskBestSellers(message='') {
 /* ---------------- Endpoint principal ---------------- */
 app.post('/chat', async (req, res) => {
   try {
-    const { message, toolResult } = req.body;
+    const { message, toolResult, meta = {} } = req.body;
+    const userFirstName = (meta.userFirstName || '').trim();
+    const FREE_TH = Number(FREE_SHIPPING_THRESHOLD_CLP ?? FREE_TH_DEFAULT);
 
     // Post-tool (después de agregar al carrito)
     if (toolResult?.id) {
@@ -431,7 +511,7 @@ app.post('/chat', async (req, res) => {
         model: 'gpt-4o-mini',
         messages: [
           { role: 'system', content: 'Eres el asistente de MundoLimpio.cl. Responde breve, útil y con CTA cuando aplique.' },
-        { role: 'user', content: `Resultado de tool cliente: ${JSON.stringify(toolResult)}` }
+          { role: 'user', content: `Resultado de tool cliente: ${JSON.stringify(toolResult)}` }
         ]
       });
       return res.json({ text: r.choices[0].message.content });
@@ -441,8 +521,8 @@ app.post('/chat', async (req, res) => {
 
     /* ===== Rama informativa / FAQs sin tarjetas ===== */
     if (intent === 'info') {
-      // 1) Intentar FAQ directa (async)
-      const faq = await faqAnswerOrNull(message || '');
+      // 1) Intentar FAQ directa
+      const faq = await faqAnswerOrNull(message || '', meta);
       if (faq) return res.json({ text: faq });
 
       // 2) Si no es FAQ, intentar extraer info de un producto relacionado
@@ -464,21 +544,40 @@ app.post('/chat', async (req, res) => {
         const url = `${BASE}/products/${node.handle}`;
         const title = (detail?.title || node.title || 'Producto').trim();
 
-        const text =
+        let text =
           `INFO: ${title}\n` +
           `${resumen}\n` +
           `URL: ${url}`;
 
+        // TIP de saludo/progreso
+        text = maybePrependGreetingTip(text, meta, FREE_TH);
         return res.json({ text });
       }
-      return res.json({ text: "¿De qué marca o tipo hablas exactamente? (ej: Astonish gel, Goo Gone, etc.) Así te doy el uso correcto y el enlace." });
+
+      // 3) Fallback de conocimiento (consejos prácticos, sin links)
+      const ai = await openai.chat.completions.create({
+        model: 'gpt-4o-mini',
+        messages: [
+          { role: 'system', content: [
+              'Eres un experto en limpieza para Chile.',
+              'Responde en español (Chile), tono cercano y claro.',
+              'Da pasos prácticos y seguros.',
+              'NO inventes enlaces, precios ni productos específicos.',
+              userFirstName ? `Si cabe, usa el nombre del usuario: ${userFirstName}.` : ''
+            ].filter(Boolean).join(' ')
+          },
+          { role: 'user', content: message || '' }
+        ]
+      });
+      return res.json({ text: ai.choices[0].message.content });
     }
 
     /* ===== Ganchos previos (browse/buy) sin IA ===== */
     // 1) Más vendidos
     if (isAskBestSellers(message || '')) {
       const items = await listTopSellers(5);
-      const text = buildProductsMarkdown(items) || "Por ahora no tengo un ranking de más vendidos.";
+      let text = buildProductsMarkdown(items) || "Por ahora no tengo un ranking de más vendidos.";
+      text = maybePrependGreetingTip(text, meta, FREE_TH);
       return res.json({ text });
     }
 
@@ -486,20 +585,32 @@ app.post('/chat', async (req, res) => {
     const brand = extractBrandOrNull(message || '');
     if (brand) {
       const items = await searchByVendor(brand, 5);
-      if (items.length) return res.json({ text: buildProductsMarkdown(items) });
+      if (items.length) {
+        let text = buildProductsMarkdown(items);
+        text = maybePrependGreetingTip(text, meta, FREE_TH);
+        return res.json({ text });
+      }
       const fallback = await searchProductsPlain(brand, 5);
-      if (fallback.length) return res.json({ text: buildProductsMarkdown(fallback) });
+      if (fallback.length) {
+        let text = buildProductsMarkdown(fallback);
+        text = maybePrependGreetingTip(text, meta, FREE_TH);
+        return res.json({ text });
+      }
       return res.json({ text: `Sí trabajamos varias marcas. No encontré resultados exactos para "${brand}". ¿Quieres que te sugiera alternativas similares?` });
     }
 
-    // 3) Sinónimos (pasta rosada / pasta original)
+    // 3) Sinónimos (pasta rosada / pasta original / ecológicos)
     const mapped = synonymQueryOrNull(message || '');
     if (mapped) {
       const items = await searchProductsPlain(mapped, 5);
-      if (items.length) return res.json({ text: buildProductsMarkdown(items) });
+      if (items.length) {
+        let text = buildProductsMarkdown(items);
+        text = maybePrependGreetingTip(text, meta, FREE_TH);
+        return res.json({ text });
+      }
     }
 
-    // === Recomendación 1 producto por zona (baño/cocina/horno) ===
+    // 4) Recomendación 1 producto por zona (baño/cocina/horno)
     const qn = norm(message || '');
     const wantsBano   = /ba[nñ]o/.test(qn);
     const wantsCocina = /cocina/.test(qn);
@@ -514,7 +625,9 @@ app.post('/chat', async (req, res) => {
       const items = await recommendZoneProducts(zones);
       if (items.length) {
         const tip = 'TIP: Te dejo 1 sugerencia por zona. Si quieres alternativas (sin aroma, más eco, etc.) dime y ajusto.';
-        return res.json({ text: `${tip}\n\n${buildProductsMarkdown(items)}` });
+        let text = `${tip}\n\n${buildProductsMarkdown(items)}`;
+        text = maybePrependGreetingTip(text, meta, FREE_TH);
+        return res.json({ text });
       }
     }
 
@@ -554,8 +667,11 @@ app.post('/chat', async (req, res) => {
             }
           `, { q: args.query });
           const items = (data.search?.edges || []).map(e => ({ title: e.node.title, handle: e.node.handle }));
-          const text = buildProductsMarkdown(items);
-          if (text) return res.json({ text });
+          let text = buildProductsMarkdown(items);
+          if (text) {
+            text = maybePrependGreetingTip(text, meta, FREE_TH);
+            return res.json({ text });
+          }
         }
 
         if (c.function.name === 'getVariantByOptions') {
@@ -593,8 +709,9 @@ app.post('/chat', async (req, res) => {
       `, { q: String(message || '').slice(0, 120) });
       const items = (forced.search?.edges || []).map(e => ({ title: e.node.title, handle: e.node.handle }));
       if (items.length) {
-        const text = buildProductsMarkdown(items);
-        if (text) return res.json({ text });
+        let text = buildProductsMarkdown(items);
+        text = maybePrependGreetingTip(text, meta, FREE_TH);
+        return res.json({ text });
       }
     } catch (err) {
       console.warn('Fallback searchProducts failed:', err?.message || err);
@@ -602,7 +719,9 @@ app.post('/chat', async (req, res) => {
 
     // Fallback 2: pedir dato extra
     return res.json({
-      text: "No encontré resultados exactos. ¿Me das una pista más (marca, superficie, aroma)? También puedo sugerir opciones similares."
+      text: userFirstName
+        ? `Gracias, ${userFirstName}. ¿Me das una pista más (marca, superficie, aroma)? También puedo sugerir opciones similares.`
+        : "No encontré resultados exactos. ¿Me das una pista más (marca, superficie, aroma)? También puedo sugerir opciones similares."
     });
 
   } catch (e) {
