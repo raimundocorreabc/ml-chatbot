@@ -36,7 +36,7 @@ const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 
 /* ---------------- Utils generales ---------------- */
 const BASE = (SHOPIFY_PUBLIC_STORE_DOMAIN || '').replace(/\/$/, '');
-const FREE_TH_DEFAULT = 40000; // default consistente: RM sobre $40.000
+const FREE_TH_DEFAULT = 40000; // RM sobre $40.000
 
 function formatCLP(n) {
   const v = Math.round(Number(n) || 0);
@@ -193,6 +193,87 @@ function stripAndTrim(s = '') {
     .trim();
 }
 
+/* ==================== PATCH 1: Helpers nuevos ==================== */
+
+// LISTAR MARCAS (vendors)
+async function listVendors(limit = 20) {
+  const data = await shopifyStorefrontGraphQL(`
+    query Vendors {
+      products(first: 100) {
+        edges { node { vendor } }
+      }
+    }
+  `);
+  const vendors = (data.products?.edges || [])
+    .map(e => (e.node.vendor || '').trim())
+    .filter(Boolean);
+
+  const freq = new Map();
+  for (const v of vendors) freq.set(v, (freq.get(v) || 0) + 1);
+  const sorted = [...freq.entries()].sort((a,b) => b[1]-a[1]).map(([v]) => v);
+
+  return sorted.slice(0, limit);
+}
+
+// LISTAR COLECCIONES
+async function listCollections(limit = 10) {
+  const data = await shopifyStorefrontGraphQL(`
+    query Colls($n:Int!) {
+      collections(first: $n) { edges { node { title handle } } }
+    }
+  `, { n: limit });
+  return (data.collections?.edges || []).map(e => ({
+    title: e.node.title,
+    handle: e.node.handle
+  }));
+}
+
+// RECOMENDAR 1 PRODUCTO POR ZONA
+async function recommendZoneProducts(zones = []) {
+  const queries = {
+    'baño':   ['astonish baño 750', 'baño limpiador astonish', 'baño desinfección'],
+    'cocina': ['cif crema', 'degreaser cocina', 'astonish kitchen'],
+    'horno':  ['astonish horno parrilla', 'goo gone bbq horno'],
+  };
+
+  const picks = [];
+  for (const z of zones) {
+    const qs = queries[z] || [];
+    let found = null;
+    for (const q of qs) {
+      const items = await searchProductsPlain(q, 1);
+      if (items.length) { found = items[0]; break; }
+    }
+    if (found) picks.push(found);
+  }
+  return picks;
+}
+
+// “OLLA QUEMADA” (TIP + productos)
+async function tipOllaQuemada() {
+  const tip = [
+    'TIP: Para **olla quemada**:',
+    '1) Cubrir el fondo con **agua caliente + bicarbonato** (o vinagre).',
+    '2) Dejar 10–15 min, soltar residuos con espátula de silicona.',
+    '3) Aplicar pasta abrillantadora/desengrasante, frotar con esponja no abrasiva y enjuagar.',
+    'Si es **acero inoxidable**, termina con un limpiador específico para eliminar vetas.'
+  ].join(' ');
+
+  const want = [
+    'pink stuff pasta 850',
+    'astonish vitroceramica kit',
+    'weiman acero inoxidable 710'
+  ];
+  const items = [];
+  for (const q of want) {
+    const r = await searchProductsPlain(q, 1);
+    if (r.length) items.push(r[0]);
+  }
+
+  const list = buildProductsMarkdown(items);
+  return list ? `${tip}\n\n${list}` : tip;
+}
+
 /* ---------------- Intent ---------------- */
 function detectIntent(text = '') {
   const qFold = fold((text || '').trim());
@@ -213,8 +294,8 @@ function detectIntent(text = '') {
   return 'browse';
 }
 
-/* ------------- FAQs rápidas (sin tarjetas) ------------- */
-function faqAnswerOrNull(message = '') {
+/* ==================== PATCH 2: FAQ async con nuevas rutas ==================== */
+async function faqAnswerOrNull(message = '') {
   const raw = (message || '').trim();
   const qFold = fold(raw);
 
@@ -237,7 +318,7 @@ function faqAnswerOrNull(message = '') {
     return `Hacemos despacho a **todo Chile**.${rmHint} Para **${comunaNice}**, el costo se calcula en el checkout al ingresar **región y comuna**. Frecuencias por zona: ${destinosUrl}`;
   }
 
-  // Preguntas genéricas de envío
+  // ENVÍOS genérico
   if (/(env[ií]o|envio|despacho|retiro)/i.test(raw)) {
     const base = `Hacemos despacho a **todo Chile**.`;
     if (/gratis|m[ií]nimo|minimo|sobre cu[aá]nto/i.test(raw)) {
@@ -248,17 +329,37 @@ function faqAnswerOrNull(message = '') {
   }
 
   // ¿Dónde canjear cupón en checkout?
-  if (/(donde|en que parte|como).*(checkout|pago|carro|carrito).*(cupon|código de descuento|codigo de descuento)/i.test(raw)) {
+  if (/(donde|en que parte|cómo|como).*(checkout|pago|carro|carrito).*(cupon|cup[oó]n|c[oó]digo de descuento|codigo de descuento)/i.test(raw)) {
     return [
-      `En el **checkout**, en la primera pantalla, verás el campo **“Código de descuento o tarjeta de regalo”**.`,
-      `Ingresa tu cupón ahí y presiona **Aplicar**.`,
-      `Si es un cupón de **Mundopuntos (Smile)**, primero genera el cupón desde el **widget de recompensas** en la tienda y luego cópialo en ese campo.`
+      `En el **checkout** (primera pantalla) verás el campo **“Código de descuento o tarjeta de regalo”**.`,
+      `Pega tu cupón y presiona **Aplicar**.`,
+      `Si es un cupón de **Mundopuntos**, primero géneralo en el **widget de recompensas** y luego cópialo en ese campo.`
     ].join(' ');
   }
 
   // ¿Qué es Mundo Limpio?
   if (/(que es|qué es|quienes son|quiénes son).*(mundolimpio|mundo limpio)/i.test(raw)) {
-    return `**MundoLimpio.cl** es una tienda chilena de productos de limpieza y hogar premium. Importamos y distribuimos marcas internacionales como **Astonish, Weiman, Goo Gone, Wright’s, 30 Seconds, JAWS**, entre otras, con foco en asesoría y soluciones reales para el hogar.`;
+    return `**MundoLimpio.cl** es una tienda chilena de productos de limpieza y hogar premium. Importamos y distribuimos marcas como **Astonish, Weiman, Goo Gone, Wright’s, 30 Seconds, JAWS**, entre otras, con foco en asesoría y soluciones reales para el hogar.`;
+  }
+
+  // ¿Qué MARCAS venden?
+  if (/(que|qué)\s+marcas.*venden|marcas\s*(disponibles|que tienen|venden)/i.test(raw)) {
+    const vendors = await listVendors(20);
+    if (!vendors.length) return 'Trabajamos varias marcas internacionales y locales. ¿Cuál te interesa?';
+    return `Trabajamos marcas como: **${vendors.join('**, **')}**. ¿Buscas alguna en particular?`;
+  }
+
+  // ¿Qué TIPOS de productos venden?
+  if (/(que|qué)\s+tipos\s+de\s+productos\s+venden|categor[ií]as|secciones|colecciones/i.test(raw)) {
+    const cols = await listCollections(10);
+    if (!cols.length) return 'Tenemos múltiples categorías: cocina, baño, pisos, lavandería, superficies, accesorios y más.';
+    const lines = cols.map(c => `- [${c.title}](${BASE}/collections/${c.handle})`).join('\n');
+    return `Estas son algunas categorías:\n\n${lines}`;
+  }
+
+  // OLLA QUEMADA (guía + productos)
+  if (/olla.*quemad/i.test(qFold)) {
+    return await tipOllaQuemada();
   }
 
   // MUNDOPUNTOS (sin link si no hay página)
@@ -277,7 +378,7 @@ function faqAnswerOrNull(message = '') {
     return parts.join(' ');
   }
 
-  // HONGOS / MOHO EN BAÑO (guía rápida)
+  // HONGOS / MOHO EN BAÑO
   if (/(hongo|moho).*(baño|ducha|tina)|sacar los hongos|sacar hongos/i.test(raw)) {
     return [
       `Para **hongos/moho en el baño**:`,
@@ -310,7 +411,6 @@ function extractBrandOrNull(message='') {
   const m = q.match(/tienen la marca\s+([a-z0-9&\-\s]+)/i) || q.match(/tienen\s+([a-z0-9&\-\s]+)\??$/i);
   if (!m) return null;
   const brand = m[1].trim();
-  // Saneamos cosas cortas/ruidosas
   if (brand.length < 2 || brand.length > 40) return null;
   return brand;
 }
@@ -331,7 +431,7 @@ app.post('/chat', async (req, res) => {
         model: 'gpt-4o-mini',
         messages: [
           { role: 'system', content: 'Eres el asistente de MundoLimpio.cl. Responde breve, útil y con CTA cuando aplique.' },
-          { role: 'user', content: `Resultado de tool cliente: ${JSON.stringify(toolResult)}` }
+        { role: 'user', content: `Resultado de tool cliente: ${JSON.stringify(toolResult)}` }
         ]
       });
       return res.json({ text: r.choices[0].message.content });
@@ -341,8 +441,8 @@ app.post('/chat', async (req, res) => {
 
     /* ===== Rama informativa / FAQs sin tarjetas ===== */
     if (intent === 'info') {
-      // 1) Intentar FAQ directa
-      const faq = faqAnswerOrNull(message || '');
+      // 1) Intentar FAQ directa (async)
+      const faq = await faqAnswerOrNull(message || '');
       if (faq) return res.json({ text: faq });
 
       // 2) Si no es FAQ, intentar extraer info de un producto relacionado
@@ -387,7 +487,6 @@ app.post('/chat', async (req, res) => {
     if (brand) {
       const items = await searchByVendor(brand, 5);
       if (items.length) return res.json({ text: buildProductsMarkdown(items) });
-      // si no hay por vendor, intenta búsqueda general por palabra
       const fallback = await searchProductsPlain(brand, 5);
       if (fallback.length) return res.json({ text: buildProductsMarkdown(fallback) });
       return res.json({ text: `Sí trabajamos varias marcas. No encontré resultados exactos para "${brand}". ¿Quieres que te sugiera alternativas similares?` });
@@ -398,7 +497,25 @@ app.post('/chat', async (req, res) => {
     if (mapped) {
       const items = await searchProductsPlain(mapped, 5);
       if (items.length) return res.json({ text: buildProductsMarkdown(items) });
-      // si falla, seguimos al flujo IA
+    }
+
+    // === Recomendación 1 producto por zona (baño/cocina/horno) ===
+    const qn = norm(message || '');
+    const wantsBano   = /ba[nñ]o/.test(qn);
+    const wantsCocina = /cocina/.test(qn);
+    const wantsHorno  = /horno/.test(qn);
+
+    if (wantsBano || wantsCocina || wantsHorno) {
+      const zones = [];
+      if (wantsBano) zones.push('baño');
+      if (wantsCocina) zones.push('cocina');
+      if (wantsHorno) zones.push('horno');
+
+      const items = await recommendZoneProducts(zones);
+      if (items.length) {
+        const tip = 'TIP: Te dejo 1 sugerencia por zona. Si quieres alternativas (sin aroma, más eco, etc.) dime y ajusto.';
+        return res.json({ text: `${tip}\n\n${buildProductsMarkdown(items)}` });
+      }
     }
 
     /* ===== Rama browse/buy con IA (tools) ===== */
