@@ -26,7 +26,8 @@ app.use(cors({
 
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 
-async function shopifyStorefrontGraphQL(query, variables={}) {
+/** Util Shopify */
+async function shopifyStorefrontGraphQL(query, variables = {}) {
   const url = `https://${SHOPIFY_STORE_DOMAIN}/api/2025-07/graphql.json`;
   const r = await fetch(url, {
     method: 'POST',
@@ -42,6 +43,7 @@ async function shopifyStorefrontGraphQL(query, variables={}) {
   return data.data;
 }
 
+/** JSON público (para obtener ID NUMÉRICO de variante usado por /cart/add.js) */
 async function getProductJsonByHandle(handle) {
   const url = `${SHOPIFY_PUBLIC_STORE_DOMAIN.replace(/\/$/, '')}/products/${handle}.js`;
   const r = await fetch(url);
@@ -49,12 +51,13 @@ async function getProductJsonByHandle(handle) {
   return r.json();
 }
 
+/** Tools (function calling) */
 const tools = [
   {
     type: 'function',
     function: {
       name: 'searchProducts',
-      description: 'Busca productos por texto. Devuelve top 5 con handle y variantes.',
+      description: 'Busca productos por texto y devuelve hasta 5 resultados con URL real y variantes.',
       parameters: { type: 'object', properties: { query: { type: 'string' } }, required: ['query'] }
     }
   },
@@ -65,7 +68,10 @@ const tools = [
       description: 'Dado un handle y opciones, devuelve variantId NUMÉRICO para /cart/add.js.',
       parameters: {
         type: 'object',
-        properties: { handle: { type: 'string' }, options: { type: 'object', additionalProperties: { type: 'string' } } },
+        properties: {
+          handle: { type: 'string' },
+          options: { type: 'object', additionalProperties: { type: 'string' } }
+        },
         required: ['handle']
       }
     }
@@ -92,6 +98,7 @@ const tools = [
   }
 ];
 
+/** FAQs base (ajusta a tus políticas reales) */
 const FAQS = {
   envios: "Envíos a todo Chile. RM: 1–2 días hábiles; Regiones: 2–5 días según courier.",
   cambios: "10 días cambios por preferencia y 6 meses por fallas. Sin uso y con empaque original.",
@@ -99,6 +106,7 @@ const FAQS = {
   puntos: "1 mundopunto por cada $1.000 CLP. Canje en checkout en 'Código de descuento o tarjeta de regalo'."
 };
 
+/** Router de tools */
 async function toolRouter(name, args) {
   if (name === 'searchProducts') {
     const data = await shopifyStorefrontGraphQL(`
@@ -115,7 +123,27 @@ async function toolRouter(name, args) {
         }
       }
     `, { q: args.query });
-    return { items: (data.search.edges || []).map(e => e.node) };
+
+    const base = SHOPIFY_PUBLIC_STORE_DOMAIN.replace(/\/$/, '');
+    const items = (data.search.edges || []).map(e => {
+      const p = e.node;
+      return {
+        id: p.id,
+        title: p.title,
+        handle: p.handle,
+        url: `${base}/products/${p.handle}`,      // <-- URL REAL en tu dominio
+        vendor: p.vendor,
+        productType: p.productType,
+        variants: (p.variants?.edges || []).map(v => ({
+          id: v.node.id,
+          title: v.node.title,
+          availableForSale: v.node.availableForSale,
+          price: v.node.price, // { amount, currencyCode }
+          selectedOptions: v.node.selectedOptions
+        }))
+      };
+    });
+    return { items };
   }
 
   if (name === 'getVariantByOptions') {
@@ -124,7 +152,8 @@ async function toolRouter(name, args) {
     const vals = Object.values(options).map(v => String(v).toLowerCase().trim()).filter(Boolean);
     let match = null;
     for (const v of p.variants) {
-      const pack = [v.title, v.option1, v.option2, v.option3].filter(Boolean).map(s => String(s).toLowerCase().trim());
+      const pack = [v.title, v.option1, v.option2, v.option3]
+        .filter(Boolean).map(s => String(s).toLowerCase().trim());
       const ok = vals.every(val => pack.some(piece => piece.includes(val)));
       if (ok) { match = v; break; }
     }
@@ -138,61 +167,109 @@ async function toolRouter(name, args) {
   return {};
 }
 
+/** Endpoint principal con instrucciones reforzadas */
 app.post('/chat', async (req, res) => {
   try {
     const { message, toolResult } = req.body;
 
+    // Respuesta posterior a ejecutar una tool en el cliente
     if (toolResult?.id) {
       const r = await openai.chat.completions.create({
         model: 'gpt-4o-mini',
         messages: [
-          { role: 'system', content: 'Eres el asistente de MundoLimpio.cl. Responde breve y con CTA.' },
+          {
+            role: 'system',
+            content: [
+              "Eres el asistente de MundoLimpio.cl.",
+              "Nunca inventes productos, precios ni enlaces.",
+              "Si hablas de productos, usa SIEMPRE resultados reales que te entregue el sistema o las herramientas.",
+              "Responde breve y con CTA."
+            ].join(' ')
+          },
           { role: 'user', content: `Resultado de tool cliente: ${JSON.stringify(toolResult)}` }
         ]
       });
       return res.json({ text: r.choices[0].message.content });
     }
 
+    // Flujo normal
     const r = await openai.chat.completions.create({
       model: 'gpt-4o-mini',
       tools,
       tool_choice: 'auto',
       messages: [
-        { role: 'system', content:
-          "Eres el asistente de MundoLimpio.cl. Si piden comprar: searchProducts→getVariantByOptions→addToCartClient. Para políticas: getFAQ. Español Chile y CTA." },
+        {
+          role: 'system',
+          content: [
+            "Eres el asistente de MundoLimpio.cl.",
+            "NUNCA inventes productos, precios ni enlaces.",
+            "Para recomendar productos DEBES usar la función searchProducts y basarte en sus resultados.",
+            "Cuando listes productos, incluye el título y el enlace REAL usando el campo 'url' que te entrega el sistema (no construyas enlaces manualmente).",
+            "Si no hay resultados, pide 1 dato extra (por ejemplo: marca, fragancia, superficie) o ofrece alternativas del catálogo.",
+            "Para agregar al carrito: getVariantByOptions -> addToCartClient.",
+            "Para políticas: getFAQ.",
+            "Español Chile, tono claro y con CTA."
+          ].join(' ')
+        },
         { role: 'user', content: message || '' }
       ]
     });
 
     const msg = r.choices[0].message;
+
+    // ¿El modelo pidió herramientas?
     if (msg.tool_calls?.length) {
       const calls = [];
       for (const c of msg.tool_calls) {
         const args = JSON.parse(c.function.arguments || '{}');
         const result = await toolRouter(c.function.name, args);
-        if (result.__clientToolCall) calls.push({ id: c.id, name: c.function.name, arguments: args });
-        else calls.push({ id: c.id, name: c.function.name, result });
+        if (result.__clientToolCall) {
+          calls.push({ id: c.id, name: c.function.name, arguments: args });
+        } else {
+          calls.push({ id: c.id, name: c.function.name, result });
+        }
       }
-      const needsClient = calls.find(c => c.name === 'addToCartClient' && !c.result);
-      if (needsClient) return res.json({ toolCalls: [{ id: needsClient.id, name: 'addToCartClient', arguments: needsClient.arguments }] });
 
+      // Si hay que ejecutar en el cliente (agregar al carrito)
+      const needsClient = calls.find(c => c.name === 'addToCartClient' && !c.result);
+      if (needsClient) {
+        return res.json({ toolCalls: [{ id: needsClient.id, name: 'addToCartClient', arguments: needsClient.arguments }] });
+      }
+
+      // Segunda pasada: el modelo convierte resultados en texto (con URLs reales incluidas en 'result')
       const follow = await openai.chat.completions.create({
         model: 'gpt-4o-mini',
         messages: [
-          { role: 'system', content: 'Convierte resultados en respuesta breve con CTA.' },
+          {
+            role: 'system',
+            content: [
+              "Convierte los resultados de herramientas en una respuesta corta y útil.",
+              "Usa solo los datos entregados por las herramientas.",
+              "Cuando muestres productos, usa el campo 'url' proporcionado (no inventes links).",
+              "Incluye CTA: ofrece agregar al carrito o ver más detalles."
+            ].join(' ')
+          },
           { role: 'user', content: JSON.stringify(calls) }
         ]
       });
       return res.json({ text: follow.choices[0].message.content });
     }
 
-    res.json({ text: msg.content });
+    // Respuesta directa (sin tools)
+    return res.json({ text: msg.content });
   } catch (e) {
     console.error(e);
+    // Fallback amable si hay errores de cuota u otros
+    if (e?.code === 'insufficient_quota' || e?.status === 429) {
+      return res.json({
+        text: "Por ahora no puedo generar respuesta automática. Dime qué producto buscas y te paso el enlace real para agregarlo al carrito."
+      });
+    }
     res.status(500).json({ error: String(e) });
   }
 });
 
+/** Health */
 app.get('/health', (_, res) => res.json({ ok: true }));
 
 // Render asigna PORT automáticamente:
