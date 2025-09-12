@@ -51,7 +51,7 @@ async function getProductJsonByHandle(handle) {
   return r.json();
 }
 
-// Detalles por handle con descripción
+// Detalles por handle (incluye description)
 async function getProductDetailsByHandle(handle) {
   const data = await shopifyStorefrontGraphQL(`
     query ProductByHandle($h: String!) {
@@ -104,14 +104,14 @@ const tools = [
   }
 ];
 
-/* ---------------- Helpers de respuesta ---------------- */
+/* ---------------- Helpers ---------------- */
 const BASE = (SHOPIFY_PUBLIC_STORE_DOMAIN || '').replace(/\/$/, '');
 
 function buildProductsMarkdown(items = []) {
   if (!items.length) return null;
   const lines = items.map((p, i) => {
     const safeTitle = (p.title || 'Ver producto').replace(/\*/g, '');
-    return `${i + 1}. **[${safeTitle}](${BASE}/products/${p.handle})** – agrega al carrito o ve más detalles.`;
+    return `${i + 1}. **[${safeTitle}](${BASE}/products/${p.handle})** – agrega al carrito o ver más detalles.`;
   });
   return `Aquí tienes opciones:\n\n${lines.join('\n')}`;
 }
@@ -136,7 +136,6 @@ function detectIntent(text = '') {
   ];
   if (infoTriggers.some(k => q.includes(k))) return 'info';
   if (buyTriggers.some(k => q.includes(k))) return 'buy';
-  // por defecto: browse/mixto → dejamos que intente recomendar pero con fallback
   return 'browse';
 }
 
@@ -159,9 +158,9 @@ app.post('/chat', async (req, res) => {
 
     const intent = detectIntent(message || '');
 
-    /* ===== Rama informativa: responde “para qué sirve / cómo usar” ===== */
+    /* ===== Rama informativa ===== */
     if (intent === 'info') {
-      // Buscar el producto más cercano y devolver explicación + link (1 tarjeta).
+      // Buscar 1 producto relacionado y devolver explicación + URL (formato especial para el front)
       const forced = await shopifyStorefrontGraphQL(`
         query ProductSearch($q: String!) {
           search(query: $q, types: PRODUCT, first: 1) {
@@ -169,22 +168,28 @@ app.post('/chat', async (req, res) => {
           }
         }
       `, { q: String(message || '').slice(0, 120) });
+
       const node = forced?.search?.edges?.[0]?.node;
       if (node?.handle) {
         const detail = await getProductDetailsByHandle(node.handle);
         const desc = stripAndTrim(detail?.description || '');
-        const resumen = desc ? (desc.length > 400 ? desc.slice(0, 400) + '…' : desc) : 'Es un limpiador multiusos diseñado para remover suciedad difícil de superficies compatibles.';
+        const resumen = desc
+          ? (desc.length > 400 ? desc.slice(0, 400) + '…' : desc)
+          : 'Es un limpiador multiusos diseñado para remover suciedad difícil de superficies compatibles.';
         const url = `${BASE}/products/${node.handle}`;
+        const title = (detail?.title || node.title || 'Producto').trim();
+
         const text =
-          `**${detail?.title || node.title}** — ${resumen}\n\n` +
-          `Puedes ver más detalles o comprar aquí: ${url}`;
+          `INFO: ${title}\n` +   // ← marcador para el front
+          `${resumen}\n` +
+          `URL: ${url}`;         // ← URL en línea aparte
+
         return res.json({ text });
       }
-      // Si no encuentra nada, pide un dato extra
       return res.json({ text: "¿De qué marca o tipo hablas exactamente? (ej: Astonish, crema, gel) Así te doy el uso correcto y el enlace." });
     }
 
-    /* ===== Rama “browse/buy”: normal con tools y fallback ===== */
+    /* ===== Rama browse/buy (con tools) ===== */
     const r = await openai.chat.completions.create({
       model: 'gpt-4o-mini',
       tools,
@@ -208,10 +213,9 @@ app.post('/chat', async (req, res) => {
     const msg = r.choices[0].message;
 
     if (msg.tool_calls?.length) {
-      const calls = [];
       for (const c of msg.tool_calls) {
         const args = JSON.parse(c.function.arguments || '{}');
-        // ejecuta tools del servidor
+
         if (c.function.name === 'searchProducts') {
           const data = await shopifyStorefrontGraphQL(`
             query ProductSearch($q: String!) {
@@ -221,7 +225,6 @@ app.post('/chat', async (req, res) => {
             }
           `, { q: args.query });
           const items = (data.search?.edges || []).map(e => ({ title: e.node.title, handle: e.node.handle }));
-          // inmediatamente devolvemos texto determinista con links
           const text = buildProductsMarkdown(items);
           if (text) return res.json({ text });
         }
@@ -232,14 +235,13 @@ app.post('/chat', async (req, res) => {
           const vals = Object.values(options).map(v => String(v).toLowerCase().trim()).filter(Boolean);
           let match = null;
           for (const v of p.variants) {
-            const pack = [v.title, v.option1, v.option2, v.option3].filter(Boolean)
-                          .map(s => String(s).toLowerCase().trim());
+            const pack = [v.title, v.option1, v.option2, v.option3]
+              .filter(Boolean).map(s => String(s).toLowerCase().trim());
             const ok = vals.every(val => pack.some(piece => piece.includes(val)));
             if (ok) { match = v; break; }
           }
           if (!match) match = p.variants.find(v => v.available) || p.variants[0];
           if (!match) throw new Error('Sin variantes para ' + handle);
-          // devolvemos toolCalls para que el cliente agregue al carrito
           return res.json({
             toolCalls: [{
               id: c.id,
@@ -249,10 +251,9 @@ app.post('/chat', async (req, res) => {
           });
         }
       }
-      // Si llegó aquí sin coincidencias manejadas, cae al fallback de abajo
     }
 
-    // Fallback 1: búsqueda directa con el texto del usuario
+    // Fallback 1: búsqueda directa simple
     try {
       const forced = await shopifyStorefrontGraphQL(`
         query ProductSearch($q: String!) {
@@ -270,7 +271,7 @@ app.post('/chat', async (req, res) => {
       console.warn('Fallback searchProducts failed:', err?.message || err);
     }
 
-    // Fallback 2: consulta genérica si no encontró match
+    // Fallback 2: pedir dato extra
     return res.json({
       text: "No encontré resultados exactos. ¿Me das una pista más (marca, superficie, aroma)? También puedo sugerir opciones similares."
     });
