@@ -5,9 +5,9 @@ import OpenAI from 'openai';
 
 const {
   OPENAI_API_KEY,
-  SHOPIFY_STORE_DOMAIN,         // mundolimpio-cl.myshopify.com
-  SHOPIFY_STOREFRONT_TOKEN,     // tu token Storefront
-  SHOPIFY_PUBLIC_STORE_DOMAIN,  // https://www.mundolimpio.cl
+  SHOPIFY_STORE_DOMAIN,         // p.ej. mundolimpio-cl.myshopify.com
+  SHOPIFY_STOREFRONT_TOKEN,     // token Storefront
+  SHOPIFY_PUBLIC_STORE_DOMAIN,  // p.ej. https://www.mundolimpio.cl
   ALLOWED_ORIGINS,
   PORT
 } = process.env;
@@ -16,7 +16,11 @@ if (!OPENAI_API_KEY) throw new Error("Falta OPENAI_API_KEY");
 if (!SHOPIFY_STORE_DOMAIN || !SHOPIFY_STOREFRONT_TOKEN) throw new Error("Falta SHOPIFY_STORE_DOMAIN o SHOPIFY_STOREFRONT_TOKEN");
 if (!SHOPIFY_PUBLIC_STORE_DOMAIN) throw new Error("Falta SHOPIFY_PUBLIC_STORE_DOMAIN");
 
-const allowed = (ALLOWED_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean);
+const allowed = (ALLOWED_ORIGINS || '')
+  .split(',')
+  .map(s => s.trim())
+  .filter(Boolean);
+
 const app = express();
 app.use(express.json());
 app.use(cors({
@@ -26,7 +30,7 @@ app.use(cors({
 
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 
-/** Util Shopify */
+/* -------------------- Utils Shopify -------------------- */
 async function shopifyStorefrontGraphQL(query, variables = {}) {
   const url = `https://${SHOPIFY_STORE_DOMAIN}/api/2025-07/graphql.json`;
   const r = await fetch(url, {
@@ -43,7 +47,7 @@ async function shopifyStorefrontGraphQL(query, variables = {}) {
   return data.data;
 }
 
-/** JSON público (para obtener ID NUMÉRICO de variante usado por /cart/add.js) */
+// JSON público (para obtener ID numérico de variante para /cart/add.js)
 async function getProductJsonByHandle(handle) {
   const url = `${SHOPIFY_PUBLIC_STORE_DOMAIN.replace(/\/$/, '')}/products/${handle}.js`;
   const r = await fetch(url);
@@ -51,7 +55,7 @@ async function getProductJsonByHandle(handle) {
   return r.json();
 }
 
-/** Tools (function calling) */
+/* -------------------- Tools (function calling) -------------------- */
 const tools = [
   {
     type: 'function',
@@ -98,7 +102,6 @@ const tools = [
   }
 ];
 
-/** FAQs base (ajusta a tus políticas reales) */
 const FAQS = {
   envios: "Envíos a todo Chile. RM: 1–2 días hábiles; Regiones: 2–5 días según courier.",
   cambios: "10 días cambios por preferencia y 6 meses por fallas. Sin uso y con empaque original.",
@@ -106,7 +109,7 @@ const FAQS = {
   puntos: "1 mundopunto por cada $1.000 CLP. Canje en checkout en 'Código de descuento o tarjeta de regalo'."
 };
 
-/** Router de tools */
+/* -------------------- Tool Router -------------------- */
 async function toolRouter(name, args) {
   if (name === 'searchProducts') {
     const data = await shopifyStorefrontGraphQL(`
@@ -131,7 +134,7 @@ async function toolRouter(name, args) {
         id: p.id,
         title: p.title,
         handle: p.handle,
-        url: `${base}/products/${p.handle}`,      // <-- URL REAL en tu dominio
+        url: `${base}/products/${p.handle}`, // URL real en tu dominio
         vendor: p.vendor,
         productType: p.productType,
         variants: (p.variants?.edges || []).map(v => ({
@@ -167,7 +170,7 @@ async function toolRouter(name, args) {
   return {};
 }
 
-/** Endpoint principal con instrucciones reforzadas */
+/* -------------------- Endpoint principal -------------------- */
 app.post('/chat', async (req, res) => {
   try {
     const { message, toolResult } = req.body;
@@ -255,8 +258,38 @@ app.post('/chat', async (req, res) => {
       return res.json({ text: follow.choices[0].message.content });
     }
 
-    // Respuesta directa (sin tools)
-    return res.json({ text: msg.content });
+    /* ---------- Fallback: si el modelo NO usó tools, forzamos búsqueda ---------- */
+    try {
+      const forced = await toolRouter('searchProducts', { query: String(message || '').slice(0, 120) });
+      const items = forced?.items || [];
+      if (items.length > 0) {
+        const calls = [{ id: 'manual_search', name: 'searchProducts', result: { items } }];
+        const follow = await openai.chat.completions.create({
+          model: 'gpt-4o-mini',
+          messages: [
+            {
+              role: 'system',
+              content: [
+                "Convierte los resultados de herramientas en una respuesta corta y útil.",
+                "Usa solo los datos entregados por las herramientas.",
+                "Cuando muestres productos, usa el campo 'url' proporcionado (no inventes links).",
+                "Incluye CTA: ofrece agregar al carrito o ver más detalles."
+              ].join(' ')
+            },
+            { role: 'user', content: JSON.stringify(calls) }
+          ]
+        });
+        return res.json({ text: follow.choices[0].message.content });
+      }
+    } catch (err) {
+      console.warn('Fallback searchProducts failed:', err?.message || err);
+    }
+
+    // Si tampoco hay resultados, pedimos un dato extra
+    return res.json({
+      text: "¿Me das un poco más de detalle para ayudarte mejor? Por ejemplo: marca, tipo de superficie (azulejos, porcelanato) o si buscas un removedor de moho específico."
+    });
+
   } catch (e) {
     console.error(e);
     // Fallback amable si hay errores de cuota u otros
@@ -269,9 +302,9 @@ app.post('/chat', async (req, res) => {
   }
 });
 
-/** Health */
+/* -------------------- Healthcheck -------------------- */
 app.get('/health', (_, res) => res.json({ ok: true }));
 
-// Render asigna PORT automáticamente:
+// Render asigna PORT automáticamente
 const port = PORT || process.env.PORT || 3000;
 app.listen(port, () => console.log('ML Chat server on :' + port));
