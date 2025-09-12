@@ -12,8 +12,8 @@ const {
   ALLOWED_ORIGINS,
   PORT,
 
-  // FAQs / Config
-  FREE_SHIPPING_THRESHOLD_CLP, // si no está, usamos 40000 como default (RM)
+  // Config FAQs
+  FREE_SHIPPING_THRESHOLD_CLP, // si no está, usamos 40000 (RM)
   MUNDOPUNTOS_EARN_PER_CLP,
   MUNDOPUNTOS_REDEEM_PER_100,
   MUNDOPUNTOS_PAGE_URL
@@ -36,7 +36,7 @@ const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 
 /* ---------------- Utils generales ---------------- */
 const BASE = (SHOPIFY_PUBLIC_STORE_DOMAIN || '').replace(/\/$/, '');
-const FREE_TH_DEFAULT = 40000; // default consistente con tu banner de sitio (RM)
+const FREE_TH_DEFAULT = 40000; // default consistente: RM sobre $40.000
 
 function formatCLP(n) {
   const v = Math.round(Number(n) || 0);
@@ -44,11 +44,11 @@ function formatCLP(n) {
 }
 function titleCaseComuna(s) { return String(s||'').toLowerCase().replace(/\b\w/g, m => m.toUpperCase()); }
 
-// Normalización: quita tildes, pasa a minúsculas y pliega ñ→n (soporta "nunoa")
+// Normalización: sin tildes/minúsculas y pliega ñ→n
 function norm(s=''){ return String(s).normalize('NFD').replace(/[\u0300-\u036f]/g,'').toLowerCase(); }
 function fold(s=''){ return norm(s).replace(/ñ/g,'n'); }
 
-/* ---------------- Regiones y comunas (detección simple) ---------------- */
+/* ---------------- Regiones y comunas ---------------- */
 const REGIONES = [
   'arica y parinacota','tarapaca','antofagasta','atacama','coquimbo','valparaiso',
   'metropolitana','santiago',"o'higgins",'ohiggins','maule','nuble','biobio',
@@ -100,7 +100,44 @@ async function getProductDetailsByHandle(handle) {
   return data.product || null;
 }
 
-/* ---------------- Tools ---------------- */
+/* ---------------- Búsquedas directas (antes de IA) ---------------- */
+async function searchProductsPlain(query, first = 5) {
+  const data = await shopifyStorefrontGraphQL(`
+    query SearchProducts($q: String!, $n: Int!) {
+      search(query: $q, types: PRODUCT, first: $n) {
+        edges { node { ... on Product { title handle } } }
+      }
+    }
+  `, { q: query, n: first });
+  const items = (data.search?.edges || []).map(e => ({ title: e.node.title, handle: e.node.handle }));
+  return items;
+}
+
+async function listTopSellers(first = 5) {
+  const data = await shopifyStorefrontGraphQL(`
+    query TopSellers($n: Int!) {
+      products(first: $n, sortKey: BEST_SELLING) {
+        edges { node { title handle } }
+      }
+    }
+  `, { n: first });
+  const items = (data.products?.edges || []).map(e => ({ title: e.node.title, handle: e.node.handle }));
+  return items;
+}
+
+async function searchByVendor(vendor, first = 5) {
+  const data = await shopifyStorefrontGraphQL(`
+    query ByVendor($q: String!, $n: Int!) {
+      products(first: $n, query: $q) {
+        edges { node { title handle vendor } }
+      }
+    }
+  `, { q: `vendor:"${vendor}"`, n: first });
+  const items = (data.products?.edges || []).map(e => ({ title: e.node.title, handle: e.node.handle }));
+  return items;
+}
+
+/* ---------------- Tools de IA ---------------- */
 const tools = [
   {
     type: 'function',
@@ -165,8 +202,8 @@ function detectIntent(text = '') {
   const infoTriggers = [
     'para que sirve','como usar','instrucciones','modo de uso','ingredientes','composicion',
     'sirve para','usos','beneficios','caracteristicas','como puedo','como sacar','como limpiar',
-    'que es','envio','despacho','retiro','gratis','costo de envio','envio gratis',
-    'mundopuntos','puntos','fidelizacion'
+    'consejos','tips','que es','envio','despacho','retiro','gratis','costo de envio','envio gratis',
+    'mundopuntos','puntos','fidelizacion','checkout','cupon','codigo de descuento'
   ];
   const buyTriggers = ['comprar','agrega','agregar','añade','añadir','carrito','precio','recomiend'];
 
@@ -200,7 +237,7 @@ function faqAnswerOrNull(message = '') {
     return `Hacemos despacho a **todo Chile**.${rmHint} Para **${comunaNice}**, el costo se calcula en el checkout al ingresar **región y comuna**. Frecuencias por zona: ${destinosUrl}`;
   }
 
-  // ENVÍOS genérico (mínimos/umbral/pedido por región+comuna)
+  // Preguntas genéricas de envío
   if (/(env[ií]o|envio|despacho|retiro)/i.test(raw)) {
     const base = `Hacemos despacho a **todo Chile**.`;
     if (/gratis|m[ií]nimo|minimo|sobre cu[aá]nto/i.test(raw)) {
@@ -208,6 +245,20 @@ function faqAnswerOrNull(message = '') {
       return `${base} El costo se calcula en checkout según **región/comuna** y peso. ¿Para qué **región y comuna** lo necesitas? Frecuencias: ${destinosUrl}`;
     }
     return `${base} El costo y tiempos dependen de **región/comuna** y peso. En el checkout verás las opciones disponibles. ¿Para qué **región y comuna**? Frecuencias: ${destinosUrl}`;
+  }
+
+  // ¿Dónde canjear cupón en checkout?
+  if (/(donde|en que parte|como).*(checkout|pago|carro|carrito).*(cupon|código de descuento|codigo de descuento)/i.test(raw)) {
+    return [
+      `En el **checkout**, en la primera pantalla, verás el campo **“Código de descuento o tarjeta de regalo”**.`,
+      `Ingresa tu cupón ahí y presiona **Aplicar**.`,
+      `Si es un cupón de **Mundopuntos (Smile)**, primero genera el cupón desde el **widget de recompensas** en la tienda y luego cópialo en ese campo.`
+    ].join(' ');
+  }
+
+  // ¿Qué es Mundo Limpio?
+  if (/(que es|qué es|quienes son|quiénes son).*(mundolimpio|mundo limpio)/i.test(raw)) {
+    return `**MundoLimpio.cl** es una tienda chilena de productos de limpieza y hogar premium. Importamos y distribuimos marcas internacionales como **Astonish, Weiman, Goo Gone, Wright’s, 30 Seconds, JAWS**, entre otras, con foco en asesoría y soluciones reales para el hogar.`;
   }
 
   // MUNDOPUNTOS (sin link si no hay página)
@@ -238,6 +289,35 @@ function faqAnswerOrNull(message = '') {
   }
 
   return null;
+}
+
+/* --------- Hooks de intención de compra (antes de IA) --------- */
+function synonymQueryOrNull(message='') {
+  const q = norm(message);
+  // Pink Stuff (pasta rosada)
+  if (/pasta.*(rosada|pink)|pink.*stuff/.test(q)) {
+    return 'pink stuff pasta multiuso stardrops';
+  }
+  // Astonish (pasta original)
+  if (/pasta.*(original|astonish)|astonish.*pasta/.test(q)) {
+    return 'astonish pasta original multiuso';
+  }
+  return null;
+}
+
+function extractBrandOrNull(message='') {
+  const q = message.toLowerCase();
+  const m = q.match(/tienen la marca\s+([a-z0-9&\-\s]+)/i) || q.match(/tienen\s+([a-z0-9&\-\s]+)\??$/i);
+  if (!m) return null;
+  const brand = m[1].trim();
+  // Saneamos cosas cortas/ruidosas
+  if (brand.length < 2 || brand.length > 40) return null;
+  return brand;
+}
+
+function isAskBestSellers(message='') {
+  const q = norm(message);
+  return /(mas vendidos|más vendidos|best sellers|top ventas|lo mas vendido|lo más vendido)/.test(q);
 }
 
 /* ---------------- Endpoint principal ---------------- */
@@ -285,7 +365,7 @@ app.post('/chat', async (req, res) => {
         const title = (detail?.title || node.title || 'Producto').trim();
 
         const text =
-          `INFO: ${title}\n` +   // marcador para el front (render informativo sin tarjetas)
+          `INFO: ${title}\n` +
           `${resumen}\n` +
           `URL: ${url}`;
 
@@ -294,7 +374,34 @@ app.post('/chat', async (req, res) => {
       return res.json({ text: "¿De qué marca o tipo hablas exactamente? (ej: Astonish gel, Goo Gone, etc.) Así te doy el uso correcto y el enlace." });
     }
 
-    /* ===== Rama browse/buy (con tools) ===== */
+    /* ===== Ganchos previos (browse/buy) sin IA ===== */
+    // 1) Más vendidos
+    if (isAskBestSellers(message || '')) {
+      const items = await listTopSellers(5);
+      const text = buildProductsMarkdown(items) || "Por ahora no tengo un ranking de más vendidos.";
+      return res.json({ text });
+    }
+
+    // 2) Marca específica ("tienen la marca X")
+    const brand = extractBrandOrNull(message || '');
+    if (brand) {
+      const items = await searchByVendor(brand, 5);
+      if (items.length) return res.json({ text: buildProductsMarkdown(items) });
+      // si no hay por vendor, intenta búsqueda general por palabra
+      const fallback = await searchProductsPlain(brand, 5);
+      if (fallback.length) return res.json({ text: buildProductsMarkdown(fallback) });
+      return res.json({ text: `Sí trabajamos varias marcas. No encontré resultados exactos para "${brand}". ¿Quieres que te sugiera alternativas similares?` });
+    }
+
+    // 3) Sinónimos (pasta rosada / pasta original)
+    const mapped = synonymQueryOrNull(message || '');
+    if (mapped) {
+      const items = await searchProductsPlain(mapped, 5);
+      if (items.length) return res.json({ text: buildProductsMarkdown(items) });
+      // si falla, seguimos al flujo IA
+    }
+
+    /* ===== Rama browse/buy con IA (tools) ===== */
     const r = await openai.chat.completions.create({
       model: 'gpt-4o-mini',
       tools,
@@ -397,3 +504,4 @@ app.get('/health', (_, res) => res.json({ ok: true }));
 
 const port = PORT || process.env.PORT || 3000;
 app.listen(port, () => console.log('ML Chat server on :' + port));
+
