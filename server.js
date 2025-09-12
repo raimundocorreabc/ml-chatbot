@@ -9,7 +9,13 @@ const {
   SHOPIFY_STOREFRONT_TOKEN,
   SHOPIFY_PUBLIC_STORE_DOMAIN,
   ALLOWED_ORIGINS,
-  PORT
+  PORT,
+
+  // --- Opcionales para FAQs ---
+  FREE_SHIPPING_THRESHOLD_CLP,     // ej: 24990
+  MUNDOPUNTOS_EARN_PER_CLP,        // ej: 1   (1 punto por $1 CLP)
+  MUNDOPUNTOS_REDEEM_PER_100,      // ej: 3   (100 puntos = $3 CLP)
+  MUNDOPUNTOS_PAGE_URL             // ej: https://www.mundolimpio.cl/pages/mundopuntos
 } = process.env;
 
 if (!OPENAI_API_KEY) throw new Error("Falta OPENAI_API_KEY");
@@ -27,7 +33,14 @@ app.use(cors({
 
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 
-/* ---------------- Utils Shopify ---------------- */
+/* ---------------- Utils ---------------- */
+const BASE = (SHOPIFY_PUBLIC_STORE_DOMAIN || '').replace(/\/$/, '');
+
+function formatCLP(n) {
+  const v = Math.round(Number(n) || 0);
+  return new Intl.NumberFormat('es-CL', { style: 'currency', currency: 'CLP', maximumFractionDigits: 0 }).format(v);
+}
+
 async function shopifyStorefrontGraphQL(query, variables = {}) {
   const url = `https://${SHOPIFY_STORE_DOMAIN}/api/2025-07/graphql.json`;
   const r = await fetch(url, {
@@ -45,7 +58,7 @@ async function shopifyStorefrontGraphQL(query, variables = {}) {
 }
 
 async function getProductJsonByHandle(handle) {
-  const url = `${SHOPIFY_PUBLIC_STORE_DOMAIN.replace(/\/$/, '')}/products/${handle}.js`;
+  const url = `${BASE}/products/${handle}.js`;
   const r = await fetch(url);
   if (!r.ok) throw new Error('No se pudo leer ' + url);
   return r.json();
@@ -105,8 +118,6 @@ const tools = [
 ];
 
 /* ---------------- Helpers ---------------- */
-const BASE = (SHOPIFY_PUBLIC_STORE_DOMAIN || '').replace(/\/$/, '');
-
 function buildProductsMarkdown(items = []) {
   if (!items.length) return null;
   const lines = items.map((p, i) => {
@@ -125,18 +136,70 @@ function stripAndTrim(s = '') {
 
 function detectIntent(text = '') {
   const q = text.toLowerCase();
+
+  // Preguntas claramente informativas / how-to / políticas
   const infoTriggers = [
     'para que sirve', 'para qué sirve', 'como usar', 'cómo usar',
     'instrucciones', 'modo de uso', 'ingredientes', 'composición',
-    'sirve para', 'usos', 'beneficios', 'caracteristicas', 'características'
+    'sirve para', 'usos', 'beneficios', 'caracteristicas', 'características',
+    'como puedo', 'cómo puedo', 'como sacar', 'cómo sacar', 'como limpiar', 'cómo limpiar',
+    'que es', 'qué es',
+    'hongo', 'moho', 'baño', 'tina', 'ducha',
+    'envio', 'envío', 'despacho', 'retiro', 'gratis', 'costo de envío', 'envío gratis',
+    'mundopuntos', 'puntos', 'fidelización', 'fidelizacion'
   ];
+
+  // Claramente compra / precio
   const buyTriggers = [
     'comprar', 'agrega', 'agregar', 'añade', 'añadir',
     'carrito', 'precio', 'recomiend', 'recomiénd'
   ];
+
   if (infoTriggers.some(k => q.includes(k))) return 'info';
   if (buyTriggers.some(k => q.includes(k))) return 'buy';
   return 'browse';
+}
+
+/* ------------- FAQs rápidas (sin recomendar productos) ------------- */
+function faqAnswerOrNull(message = '') {
+  const q = message.toLowerCase();
+
+  // ENVÍO / ENVÍO GRATIS
+  if (/(env[ií]o|despacho|retiro)/.test(q)) {
+    if (/gratis/.test(q) || /sobre cu[aá]nto/i.test(q) || /m[ií]nimo/.test(q)) {
+      const th = Number(FREE_SHIPPING_THRESHOLD_CLP || 0);
+      if (th > 0) {
+        return `Tenemos **envío gratis** desde **${formatCLP(th)}** en zonas seleccionadas. Bajo ese monto, el costo se calcula al ingresar tu dirección en el checkout. ¿Te ayudo a verificar para tu comuna?`;
+      }
+      return `El costo de envío se calcula automáticamente en el checkout al ingresar tu dirección. Si me dices tu comuna puedo orientarte.`;
+    }
+    return `El costo y los tiempos de **envío** dependen de tu comuna y del peso del pedido. En el checkout verás las opciones disponibles. ¿Quieres que lo cotice por ti si me das comuna?`;
+  }
+
+  // MUNDOPUNTOS
+  if (/mundopuntos|puntos|fidelizaci[óo]n/.test(q)) {
+    const earn = Number(MUNDOPUNTOS_EARN_PER_CLP || 1);       // default: 1 punto = $1 CLP gastado
+    const redeem100 = Number(MUNDOPUNTOS_REDEEM_PER_100 || 3); // default: 100 puntos = $3 CLP
+    const url = MUNDOPUNTOS_PAGE_URL || `${BASE}/pages/mundopuntos`;
+    return [
+      `**Mundopuntos**: ganas **${earn} punto(s) por cada $1** que gastes.`,
+      `El canje es **100 puntos = ${formatCLP(redeem100)}** (≈ ${(redeem100/100*100).toFixed(0)}% de retorno).`,
+      `Puedes canjear en el checkout ingresando tu cupón. Más info: ${url}`
+    ].join('\n');
+  }
+
+  // HONGOS / MOHO EN BAÑO
+  if (/(hongo|moho).*(baño|ducha|tina)|sacar los hongos|sacar hongos/.test(q)) {
+    return [
+      `Para **hongos/moho en el baño**:`,
+      `1) Ventila y protege guantes.`,
+      `2) Aplica el limpiador antihongos en juntas/silicona, deja actuar 5–10 min.`,
+      `3) Frota con cepillo, enjuaga bien y seca.`,
+      `¿Quieres que te recomiende productos específicos para tu superficie (azulejo, silicona, cortina, etc.)?`
+    ].join('\n');
+  }
+
+  return null;
 }
 
 /* ---------------- Endpoint principal ---------------- */
@@ -158,9 +221,13 @@ app.post('/chat', async (req, res) => {
 
     const intent = detectIntent(message || '');
 
-    /* ===== Rama informativa ===== */
+    /* ===== Rama informativa / FAQs sin tarjetas ===== */
     if (intent === 'info') {
-      // Buscar 1 producto relacionado y devolver explicación + URL (formato especial para el front)
+      // 1) Primero, intenta respuesta de FAQ
+      const faq = faqAnswerOrNull(message || '');
+      if (faq) return res.json({ text: faq });
+
+      // 2) Si no es FAQ, intenta extraer info de un producto relacionado
       const forced = await shopifyStorefrontGraphQL(`
         query ProductSearch($q: String!) {
           search(query: $q, types: PRODUCT, first: 1) {
@@ -180,13 +247,13 @@ app.post('/chat', async (req, res) => {
         const title = (detail?.title || node.title || 'Producto').trim();
 
         const text =
-          `INFO: ${title}\n` +   // ← marcador para el front
+          `INFO: ${title}\n` +   // ← marcador para el front (render informativo sin tarjetas)
           `${resumen}\n` +
-          `URL: ${url}`;         // ← URL en línea aparte
+          `URL: ${url}`;
 
         return res.json({ text });
       }
-      return res.json({ text: "¿De qué marca o tipo hablas exactamente? (ej: Astonish, crema, gel) Así te doy el uso correcto y el enlace." });
+      return res.json({ text: "¿De qué marca o tipo hablas exactamente? (ej: Astonish gel, Goo Gone, etc.) Así te doy el uso correcto y el enlace." });
     }
 
     /* ===== Rama browse/buy (con tools) ===== */
@@ -292,3 +359,4 @@ app.get('/health', (_, res) => res.json({ ok: true }));
 
 const port = PORT || process.env.PORT || 3000;
 app.listen(port, () => console.log('ML Chat server on :' + port));
+
