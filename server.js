@@ -5,9 +5,9 @@ import OpenAI from 'openai';
 
 const {
   OPENAI_API_KEY,
-  SHOPIFY_STORE_DOMAIN,         // p.ej. mundolimpio-cl.myshopify.com
-  SHOPIFY_STOREFRONT_TOKEN,     // token Storefront
-  SHOPIFY_PUBLIC_STORE_DOMAIN,  // p.ej. https://www.mundolimpio.cl
+  SHOPIFY_STORE_DOMAIN,
+  SHOPIFY_STOREFRONT_TOKEN,
+  SHOPIFY_PUBLIC_STORE_DOMAIN,
   ALLOWED_ORIGINS,
   PORT
 } = process.env;
@@ -16,10 +16,7 @@ if (!OPENAI_API_KEY) throw new Error("Falta OPENAI_API_KEY");
 if (!SHOPIFY_STORE_DOMAIN || !SHOPIFY_STOREFRONT_TOKEN) throw new Error("Falta SHOPIFY_STORE_DOMAIN o SHOPIFY_STOREFRONT_TOKEN");
 if (!SHOPIFY_PUBLIC_STORE_DOMAIN) throw new Error("Falta SHOPIFY_PUBLIC_STORE_DOMAIN");
 
-const allowed = (ALLOWED_ORIGINS || '')
-  .split(',')
-  .map(s => s.trim())
-  .filter(Boolean);
+const allowed = (ALLOWED_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean);
 
 const app = express();
 app.use(express.json());
@@ -30,7 +27,7 @@ app.use(cors({
 
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 
-/* -------------------- Utils Shopify -------------------- */
+/* ---------------- Utils Shopify ---------------- */
 async function shopifyStorefrontGraphQL(query, variables = {}) {
   const url = `https://${SHOPIFY_STORE_DOMAIN}/api/2025-07/graphql.json`;
   const r = await fetch(url, {
@@ -47,7 +44,6 @@ async function shopifyStorefrontGraphQL(query, variables = {}) {
   return data.data;
 }
 
-// JSON público (para obtener ID numérico de variante para /cart/add.js)
 async function getProductJsonByHandle(handle) {
   const url = `${SHOPIFY_PUBLIC_STORE_DOMAIN.replace(/\/$/, '')}/products/${handle}.js`;
   const r = await fetch(url);
@@ -55,7 +51,21 @@ async function getProductJsonByHandle(handle) {
   return r.json();
 }
 
-/* -------------------- Tools (function calling) -------------------- */
+// Detalles por handle con descripción
+async function getProductDetailsByHandle(handle) {
+  const data = await shopifyStorefrontGraphQL(`
+    query ProductByHandle($h: String!) {
+      product(handle: $h) {
+        title
+        handle
+        description
+      }
+    }
+  `, { h: handle });
+  return data.product || null;
+}
+
+/* ---------------- Tools ---------------- */
 const tools = [
   {
     type: 'function',
@@ -91,111 +101,90 @@ const tools = [
         required: ['variantId']
       }
     }
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'getFAQ',
-      description: 'FAQ canónicas (envíos, cambios, pagos, puntos).',
-      parameters: { type: 'object', properties: { topic: { type: 'string', enum: ['envios','cambios','pagos','puntos'] } }, required: ['topic'] }
-    }
   }
 ];
 
-const FAQS = {
-  envios: "Envíos a todo Chile. RM: 1–2 días hábiles; Regiones: 2–5 días según courier.",
-  cambios: "10 días cambios por preferencia y 6 meses por fallas. Sin uso y con empaque original.",
-  pagos: "Débito/crédito y Mercado Pago. Transferencia previa para empresas.",
-  puntos: "1 mundopunto por cada $1.000 CLP. Canje en checkout en 'Código de descuento o tarjeta de regalo'."
-};
+/* ---------------- Helpers de respuesta ---------------- */
+const BASE = (SHOPIFY_PUBLIC_STORE_DOMAIN || '').replace(/\/$/, '');
 
-/* -------------------- Tool Router -------------------- */
-async function toolRouter(name, args) {
-  if (name === 'searchProducts') {
-    const data = await shopifyStorefrontGraphQL(`
-      query ProductSearch($q: String!) {
-        search(query: $q, types: PRODUCT, first: 5) {
-          edges { node { ... on Product {
-            id title handle vendor productType
-            variants(first: 50) { edges { node {
-              id title availableForSale
-              price: priceV2 { amount currencyCode }
-              selectedOptions { name value }
-            } } }
-          } } }
-        }
-      }
-    `, { q: args.query });
-
-    const base = SHOPIFY_PUBLIC_STORE_DOMAIN.replace(/\/$/, '');
-    const items = (data.search.edges || []).map(e => {
-      const p = e.node;
-      return {
-        id: p.id,
-        title: p.title,
-        handle: p.handle,
-        url: `${base}/products/${p.handle}`, // URL real en tu dominio
-        vendor: p.vendor,
-        productType: p.productType,
-        variants: (p.variants?.edges || []).map(v => ({
-          id: v.node.id,
-          title: v.node.title,
-          availableForSale: v.node.availableForSale,
-          price: v.node.price, // { amount, currencyCode }
-          selectedOptions: v.node.selectedOptions
-        }))
-      };
-    });
-    return { items };
-  }
-
-  if (name === 'getVariantByOptions') {
-    const { handle, options = {} } = args;
-    const p = await getProductJsonByHandle(handle);
-    const vals = Object.values(options).map(v => String(v).toLowerCase().trim()).filter(Boolean);
-    let match = null;
-    for (const v of p.variants) {
-      const pack = [v.title, v.option1, v.option2, v.option3]
-        .filter(Boolean).map(s => String(s).toLowerCase().trim());
-      const ok = vals.every(val => pack.some(piece => piece.includes(val)));
-      if (ok) { match = v; break; }
-    }
-    if (!match) match = p.variants.find(v => v.available) || p.variants[0];
-    if (!match) throw new Error('Sin variantes para ' + handle);
-    return { variantId: String(match.id), variantTitle: match.title };
-  }
-
-  if (name === 'addToCartClient') return { __clientToolCall: true, ...args };
-  if (name === 'getFAQ') return { answer: FAQS[args.topic] || '' };
-  return {};
+function buildProductsMarkdown(items = []) {
+  if (!items.length) return null;
+  const lines = items.map((p, i) => {
+    const safeTitle = (p.title || 'Ver producto').replace(/\*/g, '');
+    return `${i + 1}. **[${safeTitle}](${BASE}/products/${p.handle})** – agrega al carrito o ve más detalles.`;
+  });
+  return `Aquí tienes opciones:\n\n${lines.join('\n')}`;
 }
 
-/* -------------------- Endpoint principal -------------------- */
+function stripAndTrim(s = '') {
+  return String(s)
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function detectIntent(text = '') {
+  const q = text.toLowerCase();
+  const infoTriggers = [
+    'para que sirve', 'para qué sirve', 'como usar', 'cómo usar',
+    'instrucciones', 'modo de uso', 'ingredientes', 'composición',
+    'sirve para', 'usos', 'beneficios', 'caracteristicas', 'características'
+  ];
+  const buyTriggers = [
+    'comprar', 'agrega', 'agregar', 'añade', 'añadir',
+    'carrito', 'precio', 'recomiend', 'recomiénd'
+  ];
+  if (infoTriggers.some(k => q.includes(k))) return 'info';
+  if (buyTriggers.some(k => q.includes(k))) return 'buy';
+  // por defecto: browse/mixto → dejamos que intente recomendar pero con fallback
+  return 'browse';
+}
+
+/* ---------------- Endpoint principal ---------------- */
 app.post('/chat', async (req, res) => {
   try {
     const { message, toolResult } = req.body;
 
-    // Respuesta posterior a ejecutar una tool en el cliente
+    // Post-tool (después de agregar al carrito)
     if (toolResult?.id) {
       const r = await openai.chat.completions.create({
         model: 'gpt-4o-mini',
         messages: [
-          {
-            role: 'system',
-            content: [
-              "Eres el asistente de MundoLimpio.cl.",
-              "Nunca inventes productos, precios ni enlaces.",
-              "Si hablas de productos, usa SIEMPRE resultados reales que te entregue el sistema o las herramientas.",
-              "Responde breve y con CTA."
-            ].join(' ')
-          },
+          { role: 'system', content: 'Eres el asistente de MundoLimpio.cl. Responde breve, útil y con CTA cuando aplique.' },
           { role: 'user', content: `Resultado de tool cliente: ${JSON.stringify(toolResult)}` }
         ]
       });
       return res.json({ text: r.choices[0].message.content });
     }
 
-    // Flujo normal
+    const intent = detectIntent(message || '');
+
+    /* ===== Rama informativa: responde “para qué sirve / cómo usar” ===== */
+    if (intent === 'info') {
+      // Buscar el producto más cercano y devolver explicación + link (1 tarjeta).
+      const forced = await shopifyStorefrontGraphQL(`
+        query ProductSearch($q: String!) {
+          search(query: $q, types: PRODUCT, first: 1) {
+            edges { node { ... on Product { title handle } } }
+          }
+        }
+      `, { q: String(message || '').slice(0, 120) });
+      const node = forced?.search?.edges?.[0]?.node;
+      if (node?.handle) {
+        const detail = await getProductDetailsByHandle(node.handle);
+        const desc = stripAndTrim(detail?.description || '');
+        const resumen = desc ? (desc.length > 400 ? desc.slice(0, 400) + '…' : desc) : 'Es un limpiador multiusos diseñado para remover suciedad difícil de superficies compatibles.';
+        const url = `${BASE}/products/${node.handle}`;
+        const text =
+          `**${detail?.title || node.title}** — ${resumen}\n\n` +
+          `Puedes ver más detalles o comprar aquí: ${url}`;
+        return res.json({ text });
+      }
+      // Si no encuentra nada, pide un dato extra
+      return res.json({ text: "¿De qué marca o tipo hablas exactamente? (ej: Astonish, crema, gel) Así te doy el uso correcto y el enlace." });
+    }
+
+    /* ===== Rama “browse/buy”: normal con tools y fallback ===== */
     const r = await openai.chat.completions.create({
       model: 'gpt-4o-mini',
       tools,
@@ -206,11 +195,9 @@ app.post('/chat', async (req, res) => {
           content: [
             "Eres el asistente de MundoLimpio.cl.",
             "NUNCA inventes productos, precios ni enlaces.",
-            "Para recomendar productos DEBES usar la función searchProducts y basarte en sus resultados.",
-            "Cuando listes productos, incluye el título y el enlace REAL usando el campo 'url' que te entrega el sistema (no construyas enlaces manualmente).",
-            "Si no hay resultados, pide 1 dato extra (por ejemplo: marca, fragancia, superficie) o ofrece alternativas del catálogo.",
+            "Para recomendar productos usa la función searchProducts y sus resultados.",
+            "Cuando muestres productos, incluye el enlace REAL a /products/{handle}.",
             "Para agregar al carrito: getVariantByOptions -> addToCartClient.",
-            "Para políticas: getFAQ.",
             "Español Chile, tono claro y con CTA."
           ].join(' ')
         },
@@ -220,91 +207,87 @@ app.post('/chat', async (req, res) => {
 
     const msg = r.choices[0].message;
 
-    // ¿El modelo pidió herramientas?
     if (msg.tool_calls?.length) {
       const calls = [];
       for (const c of msg.tool_calls) {
         const args = JSON.parse(c.function.arguments || '{}');
-        const result = await toolRouter(c.function.name, args);
-        if (result.__clientToolCall) {
-          calls.push({ id: c.id, name: c.function.name, arguments: args });
-        } else {
-          calls.push({ id: c.id, name: c.function.name, result });
+        // ejecuta tools del servidor
+        if (c.function.name === 'searchProducts') {
+          const data = await shopifyStorefrontGraphQL(`
+            query ProductSearch($q: String!) {
+              search(query: $q, types: PRODUCT, first: 5) {
+                edges { node { ... on Product { title handle } } }
+              }
+            }
+          `, { q: args.query });
+          const items = (data.search?.edges || []).map(e => ({ title: e.node.title, handle: e.node.handle }));
+          // inmediatamente devolvemos texto determinista con links
+          const text = buildProductsMarkdown(items);
+          if (text) return res.json({ text });
+        }
+
+        if (c.function.name === 'getVariantByOptions') {
+          const { handle, options = {} } = args;
+          const p = await getProductJsonByHandle(handle);
+          const vals = Object.values(options).map(v => String(v).toLowerCase().trim()).filter(Boolean);
+          let match = null;
+          for (const v of p.variants) {
+            const pack = [v.title, v.option1, v.option2, v.option3].filter(Boolean)
+                          .map(s => String(s).toLowerCase().trim());
+            const ok = vals.every(val => pack.some(piece => piece.includes(val)));
+            if (ok) { match = v; break; }
+          }
+          if (!match) match = p.variants.find(v => v.available) || p.variants[0];
+          if (!match) throw new Error('Sin variantes para ' + handle);
+          // devolvemos toolCalls para que el cliente agregue al carrito
+          return res.json({
+            toolCalls: [{
+              id: c.id,
+              name: 'addToCartClient',
+              arguments: { variantId: String(match.id), quantity: 1 }
+            }]
+          });
         }
       }
-
-      // Si hay que ejecutar en el cliente (agregar al carrito)
-      const needsClient = calls.find(c => c.name === 'addToCartClient' && !c.result);
-      if (needsClient) {
-        return res.json({ toolCalls: [{ id: needsClient.id, name: 'addToCartClient', arguments: needsClient.arguments }] });
-      }
-
-      // Segunda pasada: el modelo convierte resultados en texto (con URLs reales incluidas en 'result')
-      const follow = await openai.chat.completions.create({
-        model: 'gpt-4o-mini',
-        messages: [
-          {
-            role: 'system',
-            content: [
-              "Convierte los resultados de herramientas en una respuesta corta y útil.",
-              "Usa solo los datos entregados por las herramientas.",
-              "Cuando muestres productos, usa el campo 'url' proporcionado (no inventes links).",
-              "Incluye CTA: ofrece agregar al carrito o ver más detalles."
-            ].join(' ')
-          },
-          { role: 'user', content: JSON.stringify(calls) }
-        ]
-      });
-      return res.json({ text: follow.choices[0].message.content });
+      // Si llegó aquí sin coincidencias manejadas, cae al fallback de abajo
     }
 
-    /* ---------- Fallback: si el modelo NO usó tools, forzamos búsqueda ---------- */
+    // Fallback 1: búsqueda directa con el texto del usuario
     try {
-      const forced = await toolRouter('searchProducts', { query: String(message || '').slice(0, 120) });
-      const items = forced?.items || [];
-      if (items.length > 0) {
-        const calls = [{ id: 'manual_search', name: 'searchProducts', result: { items } }];
-        const follow = await openai.chat.completions.create({
-          model: 'gpt-4o-mini',
-          messages: [
-            {
-              role: 'system',
-              content: [
-                "Convierte los resultados de herramientas en una respuesta corta y útil.",
-                "Usa solo los datos entregados por las herramientas.",
-                "Cuando muestres productos, usa el campo 'url' proporcionado (no inventes links).",
-                "Incluye CTA: ofrece agregar al carrito o ver más detalles."
-              ].join(' ')
-            },
-            { role: 'user', content: JSON.stringify(calls) }
-          ]
-        });
-        return res.json({ text: follow.choices[0].message.content });
+      const forced = await shopifyStorefrontGraphQL(`
+        query ProductSearch($q: String!) {
+          search(query: $q, types: PRODUCT, first: 5) {
+            edges { node { ... on Product { title handle } } }
+          }
+        }
+      `, { q: String(message || '').slice(0, 120) });
+      const items = (forced.search?.edges || []).map(e => ({ title: e.node.title, handle: e.node.handle }));
+      if (items.length) {
+        const text = buildProductsMarkdown(items);
+        if (text) return res.json({ text });
       }
     } catch (err) {
       console.warn('Fallback searchProducts failed:', err?.message || err);
     }
 
-    // Si tampoco hay resultados, pedimos un dato extra
+    // Fallback 2: consulta genérica si no encontró match
     return res.json({
-      text: "¿Me das un poco más de detalle para ayudarte mejor? Por ejemplo: marca, tipo de superficie (azulejos, porcelanato) o si buscas un removedor de moho específico."
+      text: "No encontré resultados exactos. ¿Me das una pista más (marca, superficie, aroma)? También puedo sugerir opciones similares."
     });
 
   } catch (e) {
     console.error(e);
-    // Fallback amable si hay errores de cuota u otros
     if (e?.code === 'insufficient_quota' || e?.status === 429) {
       return res.json({
-        text: "Por ahora no puedo generar respuesta automática. Dime qué producto buscas y te paso el enlace real para agregarlo al carrito."
+        text: "Estoy con alto tráfico. Dime qué producto buscas y te paso el enlace para agregarlo al carrito."
       });
     }
-    res.status(500).json({ error: String(e) });
+    return res.status(500).json({ error: String(e) });
   }
 });
 
-/* -------------------- Healthcheck -------------------- */
+/* ---------------- Health ---------------- */
 app.get('/health', (_, res) => res.json({ ok: true }));
 
-// Render asigna PORT automáticamente
 const port = PORT || process.env.PORT || 3000;
 app.listen(port, () => console.log('ML Chat server on :' + port));
