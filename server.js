@@ -50,7 +50,7 @@ function formatCLP(n) {
 }
 function titleCaseComuna(s) { return String(s||'').toLowerCase().replace(/\b\w/g, m => m.toUpperCase()); }
 
-// Normalización: sin tildes/minúsculas y pliega ñ→n
+// Normalización
 function norm(s=''){ return String(s).normalize('NFD').replace(/[\u0300-\u036f]/g,'').toLowerCase(); }
 function fold(s=''){ return norm(s).replace(/ñ/g,'n'); }
 
@@ -115,8 +115,7 @@ async function searchProductsPlain(query, first = 5) {
       }
     }
   `, { q: query, n: first });
-  const items = (data.search?.edges || []).map(e => ({ title: e.node.title, handle: e.node.handle }));
-  return items;
+  return (data.search?.edges || []).map(e => ({ title: e.node.title, handle: e.node.handle }));
 }
 
 async function listTopSellers(first = 5) {
@@ -127,8 +126,7 @@ async function listTopSellers(first = 5) {
       }
     }
   `, { n: first });
-  const items = (data.products?.edges || []).map(e => ({ title: e.node.title, handle: e.node.handle }));
-  return items;
+  return (data.products?.edges || []).map(e => ({ title: e.node.title, handle: e.node.handle }));
 }
 
 async function searchByVendor(vendor, first = 5) {
@@ -139,8 +137,7 @@ async function searchByVendor(vendor, first = 5) {
       }
     }
   `, { q: `vendor:"${vendor}"`, n: first });
-  const items = (data.products?.edges || []).map(e => ({ title: e.node.title, handle: e.node.handle }));
-  return items;
+  return (data.products?.edges || []).map(e => ({ title: e.node.title, handle: e.node.handle }));
 }
 
 // Multi-búsqueda incremental hasta completar max ítems
@@ -216,16 +213,18 @@ function stripAndTrim(s = '') {
     .trim();
 }
 
-// TIP de saludo + progreso a envío gratis (si aplica)
+// TIP de saludo + progreso a envío gratis (solo una vez y con carrito > 0)
 function maybePrependGreetingTip(text, meta, FREE_TH) {
   const name = (meta?.userFirstName || '').trim();
-  if (!name) return text;
-  let extra = '';
-  const sub = meta?.cartSubtotalCLP;
-  if (sub != null && Number.isFinite(sub) && FREE_TH > 0 && sub < FREE_TH) {
-    extra = ` | Te faltan ${formatCLP(FREE_TH - sub)} para envío gratis en RM`;
-  }
-  return `TIP: Hola, ${name} 👋${extra ? ' ' + extra : ''}\n\n${text}`;
+  const already = !!meta?.tipAlreadyShown;
+  if (!name || already) return text;
+
+  const sub = Number(meta?.cartSubtotalCLP || 0);
+  const hasCart = Number.isFinite(sub) && sub > 0;
+  const showProgress = hasCart && FREE_TH > 0 && sub < FREE_TH;
+
+  const extra = showProgress ? ` | Te faltan ${formatCLP(FREE_TH - sub)} para envío gratis en RM` : '';
+  return `TIP: Hola, ${name} 👋${extra}\n\n${text}`;
 }
 
 /* ==================== Helpers de TIPs temáticos ==================== */
@@ -250,24 +249,26 @@ async function listVendors(limit = 20) {
   return sorted.slice(0, limit);
 }
 
-// LISTAR COLECCIONES
+// LISTAR COLECCIONES (filtradas)
 async function listCollections(limit = 10) {
   const data = await shopifyStorefrontGraphQL(`
     query Colls($n:Int!) {
       collections(first: $n) { edges { node { title handle } } }
     }
-  `, { n: limit });
-  return (data.collections?.edges || []).map(e => ({
-    title: e.node.title,
-    handle: e.node.handle
+  `, { n: limit + 5 });
+  const all = (data.collections?.edges || []).map(e => ({
+    title: e.node.title, handle: e.node.handle
   }));
+  // filtra algunas no útiles
+  const skip = new Set(['frontpage','all','sale','ofertas','destacados']);
+  return all.filter(c => !skip.has(String(c.handle).toLowerCase())).slice(0, limit);
 }
 
 // RECOMENDAR 1 PRODUCTO POR ZONA
 async function recommendZoneProducts(zones = []) {
   const queries = {
     'baño':   ['astonish baño 750', 'baño limpiador astonish', 'baño desinfección'],
-    'cocina': ['cif crema', 'degreaser cocina', 'astonish kitchen'],
+    'cocina': ['degreaser cocina', 'astonish kitchen', 'cif crema'],
     'horno':  ['astonish horno parrilla', 'goo gone bbq horno'],
   };
 
@@ -284,43 +285,70 @@ async function recommendZoneProducts(zones = []) {
   return picks;
 }
 
-// OLLA QUEMADA (TIP + productos)
-async function tipOllaQuemada() {
+// TIPS concisos + productos
+async function tipVitro() {
   const tip = [
-    'TIP: Para **olla quemada**:',
-    '1) Cubrir el fondo con **agua caliente + bicarbonato** (o vinagre).',
-    '2) Dejar 10–15 min, soltar residuos con espátula de silicona.',
-    '3) Aplicar pasta abrillantadora/desengrasante, frotar con esponja no abrasiva y enjuagar.',
-    'Si es **acero inoxidable**, termina con un limpiador específico para eliminar vetas.'
-  ].join(' ');
-
-  const want = [
-    'pink stuff pasta 850',
-    'astonish vitroceramica kit',
-    'weiman acero inoxidable 710'
-  ];
-  const items = await searchMulti(want, 3);
+    'Vitrocerámica — pasos rápidos:',
+    '1) Con la placa fría, retira residuos con rasqueta plástica.',
+    '2) Aplica crema específica, deja actuar 1–2 min.',
+    '3) Pasa paño microfibra; repite en manchas quemadas.',
+    '4) Termina con protector/abrillantador si quieres más brillo.'
+  ].join('\n');
+  const items = await searchMulti(['weiman vitroceramica crema', 'weiman cook top kit', 'astonish vitroceramica'], 3);
   const list = buildProductsMarkdown(items);
-  return list ? `${tip}\n\n${list}` : tip;
+  return list ? `TIP: ${tip}\n\n${list}` : `TIP: ${tip}`;
 }
 
-// SILLÓN / TAPIZ (TIP + productos)
+async function tipAlfombra() {
+  const tip = [
+    'Alfombra — limpieza básica:',
+    '1) Aspira a fondo (pasadas cruzadas).',
+    '2) Prueba el producto en zona oculta.',
+    '3) Aplica limpiador de alfombras, cepilla suave y retira.',
+    '4) Seca con ventilación; repite si persiste la mancha.'
+  ].join('\n');
+  const items = await searchMulti(['alfombra limpiador', 'tapicerias astonish', 'protector textil'], 3);
+  const list = buildProductsMarkdown(items);
+  return list ? `TIP: ${tip}\n\n${list}` : `TIP: ${tip}`;
+}
+
+async function tipCortina() {
+  const tip = [
+    'Cortina tela — cuidado rápido:',
+    '1) Aspira el polvo con boquilla suave.',
+    '2) Trata manchas puntuales con quitamanchas de telas.',
+    '3) Lava según etiqueta (ciclo delicado) o limpieza en seco.',
+    '4) Protege con spray textil anti manchas si es habitual.'
+  ].join('\n');
+  const items = await searchMulti(['quitamanchas tela', 'protector textil', 'limpiador telas'], 3);
+  const list = buildProductsMarkdown(items);
+  return list ? `TIP: ${tip}\n\n${list}` : `TIP: ${tip}`;
+}
+
+async function tipOllaQuemada() {
+  const tip = [
+    'Olla quemada — cómo salvarla:',
+    '1) Cubre fondo con agua + bicarbonato (o vinagre).',
+    '2) Hierve 5 min y enfría; desprende con espátula.',
+    '3) Usa pasta desengrasante y enjuaga.',
+    '4) En acero inox, termina con limpiador específico.'
+  ].join('\n');
+  const items = await searchMulti(['pink stuff pasta 850', 'astonish vitroceramica kit', 'weiman acero inoxidable 710'], 3);
+  const list = buildProductsMarkdown(items);
+  return list ? `TIP: ${tip}\n\n${list}` : `TIP: ${tip}`;
+}
+
 async function tipSillon() {
   const tip = [
-    'TIP: Para **sillón/tapiz**:',
-    '1) Aspira bien (boquilla de tapiz).',
-    '2) Prueba el producto en zona oculta.',
-    '3) Aplica limpiador de telas, frota suave con microfibra, retira y deja ventilar.',
-    '4) Opcional: **protector textil** anti manchas.'
-  ].join(' ');
-  const want = [
-    'limpiador tela sofa',
-    'protector textil',
-    'quitamanchas tapiz'
-  ];
-  const items = await searchMulti(want, 3);
+    'Sillón/tapiz — rutina corta:',
+    '1) Aspira bien.',
+    '2) Prueba en zona oculta.',
+    '3) Aplica limpiador de telas y retira con microfibra.',
+    '4) Opción: protector textil anti manchas.'
+  ].join('\n');
+  const items = await searchMulti(['limpiador tela sofa', 'protector textil', 'quitamanchas tapiz'], 3);
   const list = buildProductsMarkdown(items);
-  return list ? `${tip}\n\n${list}` : tip;
+  return list ? `TIP: ${tip}\n\n${list}` : `TIP: ${tip}`;
 }
 
 /* ---------------- Intent ---------------- */
@@ -347,32 +375,33 @@ function detectIntent(text = '') {
 /* ==================== FAQ/guías (async) ==================== */
 async function faqAnswerOrNull(message = '', meta = {}) {
   const raw = (message || '').trim();
-  const qFold = fold(raw);
+  const q = norm(raw);
 
   const FREE_TH = Number(FREE_SHIPPING_THRESHOLD_CLP ?? FREE_TH_DEFAULT);
   const freeStrRM = FREE_TH > 0 ? `**envío gratis** desde **${formatCLP(FREE_TH)}**` : null;
   const destinosUrl = `${BASE}/pages/destinos-disponibles-en-chile`;
 
   // Región sola
-  if (REGIONES_FOLDED.has(qFold)) {
-    const isRM = /metropolitana|santiago/.test(qFold);
+  if (REGIONES_FOLDED.has(q)) {
+    const isRM = /metropolitana|santiago/.test(q);
     const rmExtra = isRM && freeStrRM ? ` En RM, ${freeStrRM}.` : '';
     let line = `Hacemos despacho a **todo Chile**.${rmExtra} Para regiones, el costo se calcula en el checkout según **región y comuna** y peso. Frecuencias por zona: ${destinosUrl}`;
-    // Progreso a envío gratis si tenemos subtotal
-    if (isRM && meta?.cartSubtotalCLP != null && FREE_TH > 0 && meta.cartSubtotalCLP < FREE_TH) {
-      line = `TIP: Te faltan **${formatCLP(FREE_TH - meta.cartSubtotalCLP)}** para envío gratis en RM.\n\n${line}`;
+    const sub = Number(meta?.cartSubtotalCLP || 0);
+    if (isRM && sub > 0 && FREE_TH > 0 && sub < FREE_TH) {
+      line = `TIP: Te faltan **${formatCLP(FREE_TH - sub)}** para envío gratis en RM.\n\n${line}`;
     }
     return line;
   }
 
   // Comuna sola
-  if (COMUNAS_FOLDED.has(qFold)) {
-    const idx = COMUNAS.findIndex(c => fold(c) === qFold);
+  if (COMUNAS_FOLDED.has(q)) {
+    const idx = COMUNAS.findIndex(c => fold(c) === q);
     const comunaNice = idx >= 0 ? titleCaseComuna(COMUNAS[idx]) : titleCaseComuna(raw);
     const rmHint = freeStrRM ? ` En RM, ${freeStrRM}.` : '';
     let line = `Hacemos despacho a **todo Chile**.${rmHint} Para **${comunaNice}**, el costo se calcula en el checkout al ingresar **región y comuna**. Frecuencias por zona: ${destinosUrl}`;
-    if (meta?.cartSubtotalCLP != null && FREE_TH > 0 && meta.cartSubtotalCLP < FREE_TH) {
-      line = `TIP: Te faltan **${formatCLP(FREE_TH - meta.cartSubtotalCLP)}** para envío gratis en RM.\n\n${line}`;
+    const sub = Number(meta?.cartSubtotalCLP || 0);
+    if (sub > 0 && FREE_TH > 0 && sub < FREE_TH) {
+      line = `TIP: Te faltan **${formatCLP(FREE_TH - sub)}** para envío gratis en RM.\n\n${line}`;
     }
     return line;
   }
@@ -380,8 +409,9 @@ async function faqAnswerOrNull(message = '', meta = {}) {
   // ENVÍOS genérico
   if (/(env[ií]o|envio|despacho|retiro)/i.test(raw)) {
     const base = `Hacemos despacho a **todo Chile**.`;
-    const progress = (meta?.cartSubtotalCLP != null && FREE_TH > 0 && meta.cartSubtotalCLP < FREE_TH)
-      ? `TIP: Te faltan **${formatCLP(FREE_TH - meta.cartSubtotalCLP)}** para envío gratis en RM.\n\n` : '';
+    const sub = Number(meta?.cartSubtotalCLP || 0);
+    const progress = (sub > 0 && FREE_TH > 0 && sub < FREE_TH)
+      ? `TIP: Te faltan **${formatCLP(FREE_TH - sub)}** para envío gratis en RM.\n\n` : '';
     if (/gratis|m[ií]nimo|minimo|sobre cu[aá]nto/i.test(raw)) {
       if (freeStrRM) return `${progress}${base} En **RM** ofrecemos ${freeStrRM}. Bajo ese monto, y para **regiones**, el costo se calcula en checkout según **región/comuna** y peso. ¿Para qué **región y comuna** lo necesitas? Frecuencias: ${destinosUrl}`;
       return `${progress}${base} El costo se calcula en checkout según **región/comuna** y peso. ¿Para qué **región y comuna** lo necesitas? Frecuencias: ${destinosUrl}`;
@@ -401,10 +431,10 @@ async function faqAnswerOrNull(message = '', meta = {}) {
   // ¿Qué es Mundo Limpio? / ¿Qué venden?
   if (/(que es|qué es|quienes son|quiénes son).*(mundolimpio|mundo limpio)|que venden en mundolimpio|que productos venden\??$/i.test(raw)) {
     const cols = await listCollections(8);
-    const about = `**MundoLimpio.cl** es una tienda chilena de limpieza/hogar premium. Marcas como **Astonish, Weiman, Goo Gone, Wright’s, 30 Seconds, JAWS**, entre otras.`;
-    if (!cols.length) return about;
-    const lines = cols.map(c => `- [${c.title}](${BASE}/collections/${c.handle})`).join('\n');
-    return `${about}\n\nEstas son algunas categorías:\n\n${lines}`;
+    if (!cols.length) return `**MundoLimpio.cl** es una tienda chilena de limpieza/hogar premium.`;
+    // devolvemos para el front como botones
+    const payload = cols.map(c => `${c.title}|${BASE}/collections/${c.handle}`).join('\n');
+    return `CATS:\n${payload}`;
   }
 
   // ¿Qué MARCAS venden?
@@ -414,39 +444,20 @@ async function faqAnswerOrNull(message = '', meta = {}) {
     return `Trabajamos marcas como: **${vendors.join('**, **')}**. ¿Buscas alguna en particular?`;
   }
 
-  // ¿Qué TIPOS de productos venden?
+  // ¿Qué TIPOS de productos venden? → categorías como botones
   if (/(que|qué)\s+tipos\s+de\s+productos\s+venden|categor[ií]as|secciones|colecciones/i.test(raw)) {
     const cols = await listCollections(10);
     if (!cols.length) return 'Tenemos múltiples categorías: cocina, baño, pisos, lavandería, superficies, accesorios y más.';
-    const lines = cols.map(c => `- [${c.title}](${BASE}/collections/${c.handle})`).join('\n');
-    return `Estas son algunas categorías:\n\n${lines}`;
+    const payload = cols.map(c => `${c.title}|${BASE}/collections/${c.handle}`).join('\n');
+    return `CATS:\n${payload}`;
   }
 
-  // Pet food fuera de categoría
-  if (/(comida|alimento).*(perr|gat)/i.test(raw)) {
-    return 'Por ahora no vendemos alimentos para mascotas 🐶🐱. Si buscas **control de olores** o **limpieza** para mascotas, te puedo sugerir productos específicos.';
-  }
-
-  // HONGOS interior/exterior
-  if (/hongo|moho/i.test(raw)) {
-    if (/interior|dentro|ba[nñ]o|ducha|tina|muro|pared/i.test(raw)) {
-      const items = await searchMulti(['antihongos baño', 'antihongos interior', 'moho ducha'], 5);
-      const list = buildProductsMarkdown(items);
-      const tip = 'TIP: Para **interior**: ventila, usa guantes, aplica **antihongos**, deja actuar 5–10 min, cepilla y enjuaga. Repite si es necesario.';
-      return list ? `${tip}\n\n${list}` : tip;
-    } else if (/exterior|patio|fachada|techo|terraza|madera exterior/i.test(raw)) {
-      const items = await searchMulti(['30 seconds moho', 'antihongos exterior'], 5);
-      const list = buildProductsMarkdown(items);
-      const tip = 'TIP: Para **exterior**: aplica el limpiador en superficie **seca**, deja actuar y enjuaga con manguera. Protege plantas cercanas.';
-      return list ? `${tip}\n\n${list}` : tip;
-    }
-  }
-
-  // OLLA QUEMADA
-  if (/olla.*quemad/i.test(qFold)) return await tipOllaQuemada();
-
-  // SILLÓN / TAPIZ
-  if (/sill[oó]n|sofa|sof[aá]|tapiz/i.test(qFold)) return await tipSillon();
+  // Temas específicos con TIP conciso + productos
+  if (/vitrocer[aá]mica|vitro\s*cer[aá]mica/i.test(raw)) return await tipVitro();
+  if (/alfombra(s)?/i.test(raw)) return await tipAlfombra();
+  if (/cortina(s)?/i.test(raw)) return await tipCortina();
+  if (/olla.*quemad/i.test(q)) return await tipOllaQuemada();
+  if (/sill[oó]n|sofa|sof[aá]|tapiz/i.test(q)) return await tipSillon();
 
   // MUNDOPUNTOS (sin link si no hay página)
   if (/mundopuntos|puntos|fidelizaci[óo]n/i.test(raw)) {
@@ -464,15 +475,17 @@ async function faqAnswerOrNull(message = '', meta = {}) {
     return parts.join(' ');
   }
 
-  // HONGOS / MOHO (genérico)
+  // HONGOS / MOHO (genérico breve)
   if (/(hongo|moho).*(baño|ducha|tina)|sacar los hongos|sacar hongos/i.test(raw)) {
-    return [
-      `Para **hongos/moho en el baño**:`,
-      `1) Ventila y usa guantes.`,
-      `2) Aplica limpiador antihongos en juntas/silicona, deja actuar 5–10 min.`,
-      `3) Frota con cepillo, enjuaga y seca.`,
-      `¿Te recomiendo productos específicos según superficie (azulejo, silicona, cortina)?`
+    const items = await searchMulti(['antihongos baño', 'antihongos interior', 'moho ducha'], 3);
+    const tip = [
+      'Baño con hongos — rápido:',
+      '1) Ventila y usa guantes.',
+      '2) Aplica antihongos 5–10 min.',
+      '3) Cepilla, enjuaga y seca bien.'
     ].join('\n');
+    const list = buildProductsMarkdown(items);
+    return list ? `TIP: ${tip}\n\n${list}` : `TIP: ${tip}`;
   }
 
   return null;
@@ -481,11 +494,8 @@ async function faqAnswerOrNull(message = '', meta = {}) {
 /* --------- Hooks de intención de compra (antes de IA) --------- */
 function synonymQueryOrNull(message='') {
   const q = norm(message);
-  // Pink Stuff (pasta rosada)
   if (/pasta.*(rosada|pink)|pink.*stuff/.test(q)) return 'pink stuff pasta multiuso stardrops';
-  // Astonish (pasta original)
   if (/pasta.*(original|astonish)|astonish.*pasta/.test(q)) return 'astonish pasta original multiuso';
-  // Eco
   if (/ecolog|eco|biodegrad/i.test(q)) return 'ecologico biodegradable eco plant-based';
   return null;
 }
@@ -527,9 +537,12 @@ app.post('/chat', async (req, res) => {
 
     /* ===== Rama informativa / FAQs sin tarjetas ===== */
     if (intent === 'info') {
-      // 1) Intentar FAQ directa
+      // 1) Intentar FAQ directa (incluye TIPS + productos cuando aplica)
       const faq = await faqAnswerOrNull(message || '', meta);
-      if (faq) return res.json({ text: faq });
+      if (faq) {
+        const withTip = maybePrependGreetingTip(faq, meta, FREE_TH);
+        return res.json({ text: withTip });
+      }
 
       // 2) Si no es FAQ, intentar extraer info de un producto relacionado
       const forced = await shopifyStorefrontGraphQL(`
@@ -545,29 +558,24 @@ app.post('/chat', async (req, res) => {
         const detail = await getProductDetailsByHandle(node.handle);
         const desc = stripAndTrim(detail?.description || '');
         const resumen = desc
-          ? (desc.length > 400 ? desc.slice(0, 400) + '…' : desc)
+          ? (desc.length > 300 ? desc.slice(0, 300) + '…' : desc)
           : 'Es un limpiador multiusos diseñado para remover suciedad difícil de superficies compatibles.';
         const url = `${BASE}/products/${node.handle}`;
         const title = (detail?.title || node.title || 'Producto').trim();
 
-        let text =
-          `INFO: ${title}\n` +
-          `${resumen}\n` +
-          `URL: ${url}`;
-
-        // TIP de saludo/progreso
+        let text = `INFO: ${title}\n${resumen}\nURL: ${url}`;
         text = maybePrependGreetingTip(text, meta, FREE_TH);
         return res.json({ text });
       }
 
-      // 3) Fallback de conocimiento (consejos prácticos, sin links)
+      // 3) Fallback de conocimiento (consejos cortos, sin links inventados)
       const ai = await openai.chat.completions.create({
         model: 'gpt-4o-mini',
         messages: [
           { role: 'system', content: [
               'Eres un experto en limpieza para Chile.',
               'Responde en español (Chile), tono cercano y claro.',
-              'Da pasos prácticos y seguros.',
+              'Da pasos breves y prácticos (máx 5 bullets).',
               'NO inventes enlaces, precios ni productos específicos.',
               userFirstName ? `Si cabe, usa el nombre del usuario: ${userFirstName}.` : ''
             ].filter(Boolean).join(' ')
@@ -575,11 +583,11 @@ app.post('/chat', async (req, res) => {
           { role: 'user', content: message || '' }
         ]
       });
-      return res.json({ text: ai.choices[0].message.content });
+      const text = maybePrependGreetingTip(ai.choices[0].message.content, meta, FREE_TH);
+      return res.json({ text });
     }
 
     /* ===== Ganchos previos (browse/buy) sin IA) ===== */
-    // 1) Más vendidos
     if (isAskBestSellers(message || '')) {
       const items = await listTopSellers(5);
       let text = buildProductsMarkdown(items) || "Por ahora no tengo un ranking de más vendidos.";
@@ -587,7 +595,6 @@ app.post('/chat', async (req, res) => {
       return res.json({ text });
     }
 
-    // 2) Marca específica ("tienen la marca X")
     const brand = extractBrandOrNull(message || '');
     if (brand) {
       const items = await searchByVendor(brand, 5);
@@ -605,7 +612,6 @@ app.post('/chat', async (req, res) => {
       return res.json({ text: `Sí trabajamos varias marcas. No encontré resultados exactos para "${brand}". ¿Quieres que te sugiera alternativas similares?` });
     }
 
-    // 3) Sinónimos (pasta rosada / pasta original / ecológicos)
     const mapped = synonymQueryOrNull(message || '');
     if (mapped) {
       const items = await searchProductsPlain(mapped, 5);
@@ -616,18 +622,16 @@ app.post('/chat', async (req, res) => {
       }
     }
 
-    // 4) Recomendación 1 producto por zona (baño/cocina/horno)
+    // 1 por zona (baño/cocina/horno)
     const qn = norm(message || '');
     const wantsBano   = /ba[nñ]o/.test(qn);
     const wantsCocina = /cocina/.test(qn);
     const wantsHorno  = /horno/.test(qn);
-
     if (wantsBano || wantsCocina || wantsHorno) {
       const zones = [];
       if (wantsBano) zones.push('baño');
       if (wantsCocina) zones.push('cocina');
       if (wantsHorno) zones.push('horno');
-
       const items = await recommendZoneProducts(zones);
       if (items.length) {
         const tip = 'TIP: Te dejo 1 sugerencia por zona. Si quieres alternativas (sin aroma, más eco, etc.) dime y ajusto.';
@@ -746,3 +750,4 @@ app.get('/health', (_, res) => res.json({ ok: true }));
 
 const port = PORT || process.env.PORT || 3000;
 app.listen(port, () => console.log('ML Chat server on :' + port));
+
