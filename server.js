@@ -27,8 +27,14 @@ const allowed = (ALLOWED_ORIGINS || '').split(',').map(s => s.trim()).filter(Boo
 
 const app = express();
 app.use(express.json());
+
+// CORS con logging de diagnóstico
 app.use(cors({
-  origin: (origin, cb) => (!origin || allowed.includes(origin)) ? cb(null, true) : cb(new Error('Origen no permitido')),
+  origin: (origin, cb) => {
+    const ok = (!origin || allowed.includes(origin));
+    if (!ok) console.warn('CORS bloqueado para:', origin, ' | permitidos:', allowed);
+    return ok ? cb(null, true) : cb(new Error('Origen no permitido'));
+  },
   credentials: true
 }));
 
@@ -572,7 +578,7 @@ app.post('/chat', async (req, res) => {
       return res.json({ text: ai.choices[0].message.content });
     }
 
-    /* ===== Ganchos previos (browse/buy) sin IA ===== */
+    /* ===== Ganchos previos (browse/buy) sin IA) ===== */
     // 1) Más vendidos
     if (isAskBestSellers(message || '')) {
       const items = await listTopSellers(5);
@@ -740,4 +746,3 @@ app.get('/health', (_, res) => res.json({ ok: true }));
 
 const port = PORT || process.env.PORT || 3000;
 app.listen(port, () => console.log('ML Chat server on :' + port));
-
