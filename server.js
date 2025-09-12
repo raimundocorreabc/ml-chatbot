@@ -1,3 +1,4 @@
+// server.js
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
@@ -11,11 +12,11 @@ const {
   ALLOWED_ORIGINS,
   PORT,
 
-  // --- Opcionales para FAQs ---
-  FREE_SHIPPING_THRESHOLD_CLP,     // ej: 24990
-  MUNDOPUNTOS_EARN_PER_CLP,        // ej: 1   (1 punto por $1 CLP)
-  MUNDOPUNTOS_REDEEM_PER_100,      // ej: 3   (100 puntos = $3 CLP)
-  MUNDOPUNTOS_PAGE_URL             // ej: https://www.mundolimpio.cl/pages/mundopuntos
+  // FAQs / Config
+  FREE_SHIPPING_THRESHOLD_CLP, // si no está, usamos 40000 como default (RM)
+  MUNDOPUNTOS_EARN_PER_CLP,
+  MUNDOPUNTOS_REDEEM_PER_100,
+  MUNDOPUNTOS_PAGE_URL
 } = process.env;
 
 if (!OPENAI_API_KEY) throw new Error("Falta OPENAI_API_KEY");
@@ -33,14 +34,36 @@ app.use(cors({
 
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 
-/* ---------------- Utils ---------------- */
+/* ---------------- Utils generales ---------------- */
 const BASE = (SHOPIFY_PUBLIC_STORE_DOMAIN || '').replace(/\/$/, '');
+const FREE_TH_DEFAULT = 40000; // default consistente con tu banner de sitio (RM)
 
 function formatCLP(n) {
   const v = Math.round(Number(n) || 0);
   return new Intl.NumberFormat('es-CL', { style: 'currency', currency: 'CLP', maximumFractionDigits: 0 }).format(v);
 }
+function titleCaseComuna(s) { return String(s||'').toLowerCase().replace(/\b\w/g, m => m.toUpperCase()); }
 
+// Normalización: quita tildes, pasa a minúsculas y pliega ñ→n (soporta "nunoa")
+function norm(s=''){ return String(s).normalize('NFD').replace(/[\u0300-\u036f]/g,'').toLowerCase(); }
+function fold(s=''){ return norm(s).replace(/ñ/g,'n'); }
+
+/* ---------------- Regiones y comunas (detección simple) ---------------- */
+const REGIONES = [
+  'arica y parinacota','tarapaca','antofagasta','atacama','coquimbo','valparaiso',
+  'metropolitana','santiago',"o'higgins",'ohiggins','maule','nuble','biobio',
+  'la araucania','araucania','los rios','los lagos','aysen','magallanes'
+];
+const REGIONES_FOLDED = new Set(REGIONES.map(fold));
+
+const COMUNAS = [
+  'las condes','vitacura','lo barnechea','providencia','ñuñoa','la reina','peñalolén','santiago',
+  'macul','la florida','puente alto','maipú','huechuraba','independencia','recoleta','quilicura',
+  'conchalí','san miguel','san joaquín','la cisterna','san bernardo','colina','buin','lampa'
+];
+const COMUNAS_FOLDED = new Set(COMUNAS.map(fold));
+
+/* ---------------- Shopify utils ---------------- */
 async function shopifyStorefrontGraphQL(query, variables = {}) {
   const url = `https://${SHOPIFY_STORE_DOMAIN}/api/2025-07/graphql.json`;
   const r = await fetch(url, {
@@ -64,7 +87,6 @@ async function getProductJsonByHandle(handle) {
   return r.json();
 }
 
-// Detalles por handle (incluye description)
 async function getProductDetailsByHandle(handle) {
   const data = await shopifyStorefrontGraphQL(`
     query ProductByHandle($h: String!) {
@@ -134,68 +156,84 @@ function stripAndTrim(s = '') {
     .trim();
 }
 
+/* ---------------- Intent ---------------- */
 function detectIntent(text = '') {
-  const q = text.toLowerCase();
+  const qFold = fold((text || '').trim());
+  const isComunaOnly = COMUNAS_FOLDED.has(qFold);
+  const isRegionOnly = REGIONES_FOLDED.has(qFold);
 
-  // Preguntas claramente informativas / how-to / políticas
   const infoTriggers = [
-    'para que sirve', 'para qué sirve', 'como usar', 'cómo usar',
-    'instrucciones', 'modo de uso', 'ingredientes', 'composición',
-    'sirve para', 'usos', 'beneficios', 'caracteristicas', 'características',
-    'como puedo', 'cómo puedo', 'como sacar', 'cómo sacar', 'como limpiar', 'cómo limpiar',
-    'que es', 'qué es',
-    'hongo', 'moho', 'baño', 'tina', 'ducha',
-    'envio', 'envío', 'despacho', 'retiro', 'gratis', 'costo de envío', 'envío gratis',
-    'mundopuntos', 'puntos', 'fidelización', 'fidelizacion'
+    'para que sirve','como usar','instrucciones','modo de uso','ingredientes','composicion',
+    'sirve para','usos','beneficios','caracteristicas','como puedo','como sacar','como limpiar',
+    'que es','envio','despacho','retiro','gratis','costo de envio','envio gratis',
+    'mundopuntos','puntos','fidelizacion'
   ];
+  const buyTriggers = ['comprar','agrega','agregar','añade','añadir','carrito','precio','recomiend'];
 
-  // Claramente compra / precio
-  const buyTriggers = [
-    'comprar', 'agrega', 'agregar', 'añade', 'añadir',
-    'carrito', 'precio', 'recomiend', 'recomiénd'
-  ];
-
-  if (infoTriggers.some(k => q.includes(k))) return 'info';
-  if (buyTriggers.some(k => q.includes(k))) return 'buy';
+  if (isComunaOnly || isRegionOnly) return 'info';
+  if (infoTriggers.some(t => qFold.includes(t))) return 'info';
+  if (buyTriggers.some(t => qFold.includes(t))) return 'buy';
   return 'browse';
 }
 
-/* ------------- FAQs rápidas (sin recomendar productos) ------------- */
+/* ------------- FAQs rápidas (sin tarjetas) ------------- */
 function faqAnswerOrNull(message = '') {
-  const q = message.toLowerCase();
+  const raw = (message || '').trim();
+  const qFold = fold(raw);
 
-  // ENVÍO / ENVÍO GRATIS
-  if (/(env[ií]o|despacho|retiro)/.test(q)) {
-    if (/gratis/.test(q) || /sobre cu[aá]nto/i.test(q) || /m[ií]nimo/.test(q)) {
-      const th = Number(FREE_SHIPPING_THRESHOLD_CLP || 0);
-      if (th > 0) {
-        return `Tenemos **envío gratis** desde **${formatCLP(th)}** en zonas seleccionadas. Bajo ese monto, el costo se calcula al ingresar tu dirección en el checkout. ¿Te ayudo a verificar para tu comuna?`;
-      }
-      return `El costo de envío se calcula automáticamente en el checkout al ingresar tu dirección. Si me dices tu comuna puedo orientarte.`;
-    }
-    return `El costo y los tiempos de **envío** dependen de tu comuna y del peso del pedido. En el checkout verás las opciones disponibles. ¿Quieres que lo cotice por ti si me das comuna?`;
+  const FREE_TH = Number(FREE_SHIPPING_THRESHOLD_CLP ?? FREE_TH_DEFAULT);
+  const freeStrRM = FREE_TH > 0 ? `**envío gratis** desde **${formatCLP(FREE_TH)}**` : null;
+  const destinosUrl = `${BASE}/pages/destinos-disponibles-en-chile`;
+
+  // Región sola
+  if (REGIONES_FOLDED.has(qFold)) {
+    const isRM = /metropolitana|santiago/.test(qFold);
+    const rmExtra = isRM && freeStrRM ? ` En RM, ${freeStrRM}.` : '';
+    return `Hacemos despacho a **todo Chile**.${rmExtra} Para regiones, el costo se calcula en el checkout según **región y comuna** y peso. Frecuencias por zona: ${destinosUrl}`;
   }
 
-  // MUNDOPUNTOS
-  if (/mundopuntos|puntos|fidelizaci[óo]n/.test(q)) {
-    const earn = Number(MUNDOPUNTOS_EARN_PER_CLP || 1);       // default: 1 punto = $1 CLP gastado
-    const redeem100 = Number(MUNDOPUNTOS_REDEEM_PER_100 || 3); // default: 100 puntos = $3 CLP
-    const url = MUNDOPUNTOS_PAGE_URL || `${BASE}/pages/mundopuntos`;
-    return [
+  // Comuna sola
+  if (COMUNAS_FOLDED.has(qFold)) {
+    const idx = COMUNAS.findIndex(c => fold(c) === qFold);
+    const comunaNice = idx >= 0 ? titleCaseComuna(COMUNAS[idx]) : titleCaseComuna(raw);
+    const rmHint = freeStrRM ? ` En RM, ${freeStrRM}.` : '';
+    return `Hacemos despacho a **todo Chile**.${rmHint} Para **${comunaNice}**, el costo se calcula en el checkout al ingresar **región y comuna**. Frecuencias por zona: ${destinosUrl}`;
+  }
+
+  // ENVÍOS genérico (mínimos/umbral/pedido por región+comuna)
+  if (/(env[ií]o|envio|despacho|retiro)/i.test(raw)) {
+    const base = `Hacemos despacho a **todo Chile**.`;
+    if (/gratis|m[ií]nimo|minimo|sobre cu[aá]nto/i.test(raw)) {
+      if (freeStrRM) return `${base} En **RM** ofrecemos ${freeStrRM}. Bajo ese monto, y para **regiones**, el costo se calcula en checkout según **región/comuna** y peso. ¿Para qué **región y comuna** lo necesitas? Frecuencias: ${destinosUrl}`;
+      return `${base} El costo se calcula en checkout según **región/comuna** y peso. ¿Para qué **región y comuna** lo necesitas? Frecuencias: ${destinosUrl}`;
+    }
+    return `${base} El costo y tiempos dependen de **región/comuna** y peso. En el checkout verás las opciones disponibles. ¿Para qué **región y comuna**? Frecuencias: ${destinosUrl}`;
+  }
+
+  // MUNDOPUNTOS (sin link si no hay página)
+  if (/mundopuntos|puntos|fidelizaci[óo]n/i.test(raw)) {
+    const earn = Number(MUNDOPUNTOS_EARN_PER_CLP || 1);
+    const redeem100 = Number(MUNDOPUNTOS_REDEEM_PER_100 || 3);
+    const url = (MUNDOPUNTOS_PAGE_URL || '').trim();
+
+    const parts = [
       `**Mundopuntos**: ganas **${earn} punto(s) por cada $1** que gastes.`,
       `El canje es **100 puntos = ${formatCLP(redeem100)}** (≈ ${(redeem100/100*100).toFixed(0)}% de retorno).`,
-      `Puedes canjear en el checkout ingresando tu cupón. Más info: ${url}`
-    ].join('\n');
+      `Puedes canjear en el **checkout** ingresando tu cupón.`
+    ];
+    if (url) parts.push(`Más info: ${url}`);
+    else     parts.push(`También puedes ver y canjear tus puntos en el **widget de recompensas** en la tienda.`);
+    return parts.join(' ');
   }
 
-  // HONGOS / MOHO EN BAÑO
-  if (/(hongo|moho).*(baño|ducha|tina)|sacar los hongos|sacar hongos/.test(q)) {
+  // HONGOS / MOHO EN BAÑO (guía rápida)
+  if (/(hongo|moho).*(baño|ducha|tina)|sacar los hongos|sacar hongos/i.test(raw)) {
     return [
       `Para **hongos/moho en el baño**:`,
-      `1) Ventila y protege guantes.`,
-      `2) Aplica el limpiador antihongos en juntas/silicona, deja actuar 5–10 min.`,
-      `3) Frota con cepillo, enjuaga bien y seca.`,
-      `¿Quieres que te recomiende productos específicos para tu superficie (azulejo, silicona, cortina, etc.)?`
+      `1) Ventila y usa guantes.`,
+      `2) Aplica limpiador antihongos en juntas/silicona, deja actuar 5–10 min.`,
+      `3) Frota con cepillo, enjuaga y seca.`,
+      `¿Te recomiendo productos específicos según superficie (azulejo, silicona, cortina)?`
     ].join('\n');
   }
 
@@ -223,11 +261,11 @@ app.post('/chat', async (req, res) => {
 
     /* ===== Rama informativa / FAQs sin tarjetas ===== */
     if (intent === 'info') {
-      // 1) Primero, intenta respuesta de FAQ
+      // 1) Intentar FAQ directa
       const faq = faqAnswerOrNull(message || '');
       if (faq) return res.json({ text: faq });
 
-      // 2) Si no es FAQ, intenta extraer info de un producto relacionado
+      // 2) Si no es FAQ, intentar extraer info de un producto relacionado
       const forced = await shopifyStorefrontGraphQL(`
         query ProductSearch($q: String!) {
           search(query: $q, types: PRODUCT, first: 1) {
@@ -247,7 +285,7 @@ app.post('/chat', async (req, res) => {
         const title = (detail?.title || node.title || 'Producto').trim();
 
         const text =
-          `INFO: ${title}\n` +   // ← marcador para el front (render informativo sin tarjetas)
+          `INFO: ${title}\n` +   // marcador para el front (render informativo sin tarjetas)
           `${resumen}\n` +
           `URL: ${url}`;
 
@@ -359,4 +397,3 @@ app.get('/health', (_, res) => res.json({ ok: true }));
 
 const port = PORT || process.env.PORT || 3000;
 app.listen(port, () => console.log('ML Chat server on :' + port));
-
