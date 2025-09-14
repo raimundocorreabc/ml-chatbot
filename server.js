@@ -30,14 +30,8 @@ const allowed = (ALLOWED_ORIGINS || '').split(',').map(s => s.trim()).filter(Boo
 
 const app = express();
 app.use(express.json());
-
-// CORS con pequeño log
 app.use(cors({
-  origin: (origin, cb) => {
-    const ok = (!origin || allowed.includes(origin));
-    if (!ok) console.warn('CORS bloqueado para:', origin, ' | permitidos:', allowed);
-    return ok ? cb(null, true) : cb(new Error('Origen no permitido'));
-  },
+  origin: (origin, cb) => (!origin || allowed.includes(origin)) ? cb(null, true) : cb(new Error('Origen no permitido')),
   credentials: true
 }));
 
@@ -71,20 +65,16 @@ const COMUNAS = [
 ];
 const COMUNAS_FOLDED = new Set(COMUNAS.map(fold));
 
-/* ---------------- Tarifas de envío por zona (lo que nos diste) ---------------- */
+/* ---------------- Tarifas de envío por zona (según lo que indicaste) ---------------- */
 const SHIPPING_ZONES = [
-  { zone: 'REGIÓN METROPOLITANA', cost: 3990, regions: ['Metropolitana','Santiago'] },
-  { zone: 'ZONA CENTRAL',         cost: 6990, regions: ['Coquimbo','Valparaíso','Valparaiso',"O’Higgins","O'Higgins",'Maule','Ñuble','Nuble','Biobío','Biobio','Araucanía','Araucania','Los Ríos','Los Rios','Los Lagos'] },
+  { zone: 'REGIÓN METROPOLITANA', cost: 3990,  regions: ['Metropolitana','Santiago'] },
+  { zone: 'ZONA CENTRAL',         cost: 6990,  regions: ['Coquimbo','Valparaíso','Valparaiso',"O’Higgins","O'Higgins",'Maule','Ñuble','Nuble','Biobío','Biobio','Araucanía','Araucania','Los Ríos','Los Rios','Los Lagos'] },
   { zone: 'ZONA NORTE',           cost: 10990, regions: ['Arica y Parinacota','Tarapacá','Tarapaca','Antofagasta','Atacama'] },
   { zone: 'ZONA AUSTRAL',         cost: 14990, regions: ['Aysén','Aysen','Magallanes'] }
 ];
-// Mapa rápido region→{zone,cost}
 const REGION_COST_MAP = (() => {
   const m = new Map();
-  for (const z of SHIPPING_ZONES) {
-    for (const r of z.regions) m.set(fold(r), { zone: z.zone, cost: z.cost });
-  }
-  // RM aliases
+  for (const z of SHIPPING_ZONES) for (const r of z.regions) m.set(fold(r), { zone: z.zone, cost: z.cost });
   m.set('metropolitana', { zone: 'REGIÓN METROPOLITANA', cost: 3990 });
   m.set('santiago',      { zone: 'REGIÓN METROPOLITANA', cost: 3990 });
   return m;
@@ -164,19 +154,47 @@ async function searchByVendor(vendor, first = 5) {
   return (data.products?.edges || []).map(e => ({ title: e.node.title, handle: e.node.handle }));
 }
 
-// Multi-búsqueda incremental hasta completar max ítems
-async function searchMulti(queries = [], max = 5) {
+/* --- FALTABAN ESTAS: vendors, colecciones y 1 x zona --- */
+async function listVendors(limit = 20) {
+  const data = await shopifyStorefrontGraphQL(`
+    query Vendors {
+      products(first: 100) { edges { node { vendor } } }
+    }
+  `);
+  const vendors = (data.products?.edges || [])
+    .map(e => (e.node.vendor || '').trim())
+    .filter(Boolean);
+  const freq = new Map();
+  for (const v of vendors) freq.set(v, (freq.get(v) || 0) + 1);
+  return [...freq.entries()].sort((a,b) => b[1]-a[1]).map(([v]) => v).slice(0, limit);
+}
+
+async function listCollections(limit = 10) {
+  const data = await shopifyStorefrontGraphQL(`
+    query Colls($n:Int!) {
+      collections(first: $n) { edges { node { title handle } } }
+    }
+  `, { n: limit });
+  return (data.collections?.edges || []).map(e => ({ title: e.node.title, handle: e.node.handle }));
+}
+
+async function recommendZoneProducts(zones = []) {
+  const queries = {
+    'baño':   ['antihongos baño', 'astonish baño 750', 'limpiador baño'],
+    'cocina': ['desengrasante cocina', 'cif crema', 'astonish kitchen'],
+    'horno':  ['astonish horno', 'goo gone bbq', 'weiman cook top']
+  };
   const picks = [];
   const seen = new Set();
-  for (const q of queries) {
-    const found = await searchProductsPlain(q, 3);
-    for (const it of found) {
-      if (!seen.has(it.handle)) {
-        seen.add(it.handle);
-        picks.push(it);
-        if (picks.length >= max) return picks;
-      }
+  for (const z of zones) {
+    const qs = queries[z] || [];
+    let found = null;
+    for (const q of qs) {
+      const items = await searchProductsPlain(q, 2);
+      const it = items.find(i => !seen.has(i.handle));
+      if (it) { found = it; break; }
     }
+    if (found) { picks.push(found); seen.add(found.handle); }
   }
   return picks;
 }
@@ -231,13 +249,10 @@ function buildProductsMarkdown(items = []) {
 }
 
 function stripAndTrim(s = '') {
-  return String(s)
-    .replace(/<[^>]+>/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
+  return String(s).replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
 }
 
-// TIP de saludo + progreso a envío gratis (solo una vez y con carrito > 0)
+// TIP de saludo + progreso a envío gratis (solo una vez y si hay algo en carrito)
 function maybePrependGreetingTip(text, meta, FREE_TH) {
   const name = (meta?.userFirstName || '').trim();
   const already = !!meta?.tipAlreadyShown;
@@ -245,10 +260,22 @@ function maybePrependGreetingTip(text, meta, FREE_TH) {
 
   const sub = Number(meta?.cartSubtotalCLP || 0);
   const hasCart = Number.isFinite(sub) && sub > 0;
-  const showProgress = hasCart && FREE_TH > 0 && sub < FREE_TH;
-
-  const extra = showProgress ? ` | Te faltan ${formatCLP(FREE_TH - sub)} para envío gratis en RM` : '';
+  const extra = (hasCart && FREE_TH > 0 && sub < FREE_TH) ? ` | Te faltan ${formatCLP(FREE_TH - sub)} para envío gratis en RM` : '';
   return `TIP: Hola, ${name} 👋${extra}\n\n${text}`;
+}
+
+/* ---------------- Carrusel de marcas ---------------- */
+function parseBrandCarouselConfig() { try { return JSON.parse(BRAND_CAROUSEL_JSON || ''); } catch { return []; } }
+function buildBrandsPayload(brands = []) {
+  if (!brands.length) return null;
+  const rows = brands.map(b => {
+    const title = (b.title || '').trim();
+    const url   = (b.url   || '').trim();
+    const image = (b.image || '').trim();
+    if (!title || !url) return null;
+    return [title, url, image].join('|');
+  }).filter(Boolean);
+  return rows.length ? `BRANDS:\n${rows.join('\n')}` : null;
 }
 
 /* ==================== TIPS concisos + productos ==================== */
@@ -338,36 +365,40 @@ function detectIntent(text = '') {
   return 'browse';
 }
 
-/* ---------------- Carrusel de marcas ---------------- */
-function parseBrandCarouselConfig() {
-  try { return JSON.parse(BRAND_CAROUSEL_JSON || '[]'); } catch { return []; }
-}
-function buildBrandsPayload(brands = []) {
-  if (!brands.length) return null;
-  // Formato: BRANDS:\nTitle|URL|Image(optional)
-  const rows = brands.map(b => {
-    const title = (b.title || '').trim();
-    const url   = (b.url   || '').trim();
-    const image = (b.image || '').trim();
-    if (!title || !url) return null;
-    return [title, url, image].join('|');
-  }).filter(Boolean);
-  return rows.length ? `BRANDS:\n${rows.join('\n')}` : null;
+/* ---------------- Multi-búsqueda incremental ---------------- */
+async function searchMulti(queries = [], max = 5) {
+  const picks = [];
+  const seen = new Set();
+  for (const q of queries) {
+    const found = await searchProductsPlain(q, 3);
+    for (const it of found) {
+      if (!seen.has(it.handle)) {
+        seen.add(it.handle);
+        picks.push(it);
+        if (picks.length >= max) return picks;
+      }
+    }
+  }
+  return picks;
 }
 
 /* ==================== FAQ/guías (async) ==================== */
 async function faqAnswerOrNull(message = '', meta = {}) {
   const raw = (message || '').trim();
-  const q = norm(raw);
+
+  // Si el front envió "envío <región|comuna>", extraemos solo el lugar:
+  const mPref = raw.match(/^(env[ií]o|envio|despacho|retiro)\s+(.+)$/i);
+  const locationOnly = mPref ? mPref[2] : raw;
+  const qFold = fold(locationOnly);
 
   const FREE_TH = Number(FREE_SHIPPING_THRESHOLD_CLP ?? FREE_TH_DEFAULT);
   const destinosUrl = `${BASE}/pages/destinos-disponibles-en-chile`;
 
   // Región sola → costo referencial + recordatorio RM
-  if (REGIONES_FOLDED.has(q)) {
-    const regNice = REGIONES.find(r => fold(r) === q) || raw;
+  if (REGIONES_FOLDED.has(qFold)) {
+    const regNice = REGIONES.find(r => fold(r) === qFold) || locationOnly;
     const ship = shippingByRegionName(regNice);
-    const isRM = /metropolitana|santiago/.test(q);
+    const isRM = /metropolitana|santiago/.test(qFold);
     let parts = [];
     if (ship) {
       parts.push(`Para **${titleCaseComuna(regNice)}** (${ship.zone}), el costo referencial es **${formatCLP(ship.cost)}**.`);
@@ -381,14 +412,14 @@ async function faqAnswerOrNull(message = '', meta = {}) {
     return parts.join(' ');
   }
 
-  // Comuna sola → mantener genérico + link
-  if (COMUNAS_FOLDED.has(q)) {
-    const idx = COMUNAS.findIndex(c => fold(c) === q);
-    const comunaNice = idx >= 0 ? titleCaseComuna(COMUNAS[idx]) : titleCaseComuna(raw);
+  // Comuna sola
+  if (COMUNAS_FOLDED.has(qFold)) {
+    const idx = COMUNAS.findIndex(c => fold(c) === qFold);
+    const comunaNice = idx >= 0 ? titleCaseComuna(COMUNAS[idx]) : titleCaseComuna(locationOnly);
     return `Hacemos despacho a **todo Chile**. Para **${comunaNice}**, el costo se calcula automáticamente en el checkout al ingresar **región y comuna**. Si me confirmas la **región**, puedo darte el costo referencial. 📦 Frecuencias: ${destinosUrl}`;
   }
 
-  // ENVÍOS genérico (incluye "¿sobre cuánto tengo envío gratis?")
+  // ENVÍOS genérico (incluye “¿sobre cuánto tengo envío gratis?”)
   if (/(env[ií]o|envio|despacho|retiro)/i.test(raw)) {
     const header = FREE_TH > 0
       ? `En la **Región Metropolitana (RM)** ofrecemos **envío gratis** en compras sobre **${formatCLP(FREE_TH)}**.`
@@ -424,19 +455,17 @@ async function faqAnswerOrNull(message = '', meta = {}) {
 
   // ¿Qué MARCAS venden? → carrusel
   if (/(que|qué)\s+marcas.*venden|marcas\s*(disponibles|que tienen|venden)/i.test(raw)) {
-    // 1) si hay config manual, úsala
     const custom = parseBrandCarouselConfig();
     if (custom.length) {
       const payload = buildBrandsPayload(custom);
       if (payload) return payload;
     }
-    // 2) fallback: vendors más frecuentes (sin logo)
     const vendors = await listVendors(20);
     if (!vendors.length) return 'Trabajamos varias marcas internacionales y locales. ¿Cuál te interesa?';
     const brands = vendors.map(v => ({
       title: v,
       url: `${BASE}/collections/vendors?q=${encodeURIComponent(v)}`,
-      image: '' // sin logo por defecto
+      image: ''
     }));
     const payload = buildBrandsPayload(brands);
     return payload || `Trabajamos marcas como: **${vendors.join('**, **')}**. ¿Buscas alguna en particular?`;
@@ -450,12 +479,12 @@ async function faqAnswerOrNull(message = '', meta = {}) {
     return `CATS:\n${payload}`;
   }
 
-  // Temas específicos con TIP conciso + productos
+  // Temas específicos con TIP + productos
   if (/vitrocer[aá]mica|vitro\s*cer[aá]mica/i.test(raw)) return await tipVitro();
   if (/alfombra(s)?/i.test(raw)) return await tipAlfombra();
   if (/cortina(s)?/i.test(raw)) return await tipCortina();
-  if (/olla.*quemad/i.test(q)) return await tipOllaQuemada();
-  if (/sill[oó]n|sofa|sof[aá]|tapiz/i.test(q)) return await tipSillon();
+  if (/olla.*quemad/i.test(raw)) return await tipOllaQuemada();
+  if (/sill[oó]n|sofa|sof[aá]|tapiz/i.test(raw)) return await tipSillon();
 
   // MUNDOPUNTOS
   if (/mundopuntos|puntos|fidelizaci[óo]n/i.test(raw)) {
@@ -473,7 +502,7 @@ async function faqAnswerOrNull(message = '', meta = {}) {
     return parts.join(' ');
   }
 
-  // HONGOS / MOHO (genérico breve)
+  // HONGOS/moho genérico breve
   if (/(hongo|moho).*(baño|ducha|tina)|sacar los hongos|sacar hongos/i.test(raw)) {
     const items = await searchMulti(['antihongos baño', 'antihongos interior', 'moho ducha'], 3);
     const tip = [
@@ -489,27 +518,6 @@ async function faqAnswerOrNull(message = '', meta = {}) {
   return null;
 }
 
-/* --------- Hooks de intención de compra (antes de IA) --------- */
-function synonymQueryOrNull(message='') {
-  const q = norm(message);
-  if (/pasta.*(rosada|pink)|pink.*stuff/.test(q)) return 'pink stuff pasta multiuso stardrops';
-  if (/pasta.*(original|astonish)|astonish.*pasta/.test(q)) return 'astonish pasta original multiuso';
-  if (/ecolog|eco|biodegrad/i.test(q)) return 'ecologico biodegradable eco plant-based';
-  return null;
-}
-function extractBrandOrNull(message='') {
-  const q = message.toLowerCase();
-  const m = q.match(/tienen la marca\s+([a-z0-9&\-\s]+)/i) || q.match(/tienen\s+([a-z0-9&\-\s]+)\??$/i);
-  if (!m) return null;
-  const brand = m[1].trim();
-  if (brand.length < 2 || brand.length > 40) return null;
-  return brand;
-}
-function isAskBestSellers(message='') {
-  const q = norm(message);
-  return /(mas vendidos|más vendidos|best sellers|top ventas|lo mas vendido|lo más vendido)/.test(q);
-}
-
 /* ---------------- Endpoint principal ---------------- */
 app.post('/chat', async (req, res) => {
   try {
@@ -517,7 +525,7 @@ app.post('/chat', async (req, res) => {
     const userFirstName = (meta.userFirstName || '').trim();
     const FREE_TH = Number(FREE_SHIPPING_THRESHOLD_CLP ?? FREE_TH_DEFAULT);
 
-    // Post-tool (después de agregar al carrito)
+    // Post-tool
     if (toolResult?.id) {
       const r = await openai.chat.completions.create({
         model: 'gpt-4o-mini',
@@ -552,13 +560,9 @@ app.post('/chat', async (req, res) => {
       if (node?.handle) {
         const detail = await getProductDetailsByHandle(node.handle);
         const desc = stripAndTrim(detail?.description || '');
-        const resumen = desc
-          ? (desc.length > 300 ? desc.slice(0, 300) + '…' : desc)
-          : 'Es un limpiador multiusos diseñado para remover suciedad difícil de superficies compatibles.';
-        const url = `${BASE}/products/${node.handle}`;
-        const title = (detail?.title || node.title || 'Producto').trim();
-
-        let text = `INFO: ${title}\n${resumen}\nURL: ${url}`;
+        const resumen = desc ? (desc.length > 300 ? desc.slice(0, 300) + '…' : desc)
+                             : 'Es un limpiador multiusos diseñado para remover suciedad difícil de superficies compatibles.';
+        let text = `INFO: ${(detail?.title || node.title || 'Producto').trim()}\n${resumen}\nURL: ${BASE}/products/${node.handle}`;
         text = maybePrependGreetingTip(text, meta, FREE_TH);
         return res.json({ text });
       }
@@ -583,33 +587,53 @@ app.post('/chat', async (req, res) => {
     }
 
     /* ===== Ganchos previos (browse/buy) sin IA ===== */
-    if (isAskBestSellers(message || '')) {
+    const qn = norm(message || '');
+    if (/(mas vendidos|más vendidos|best sellers|top ventas|lo mas vendido|lo más vendido)/.test(qn)) {
       const items = await listTopSellers(5);
       let text = buildProductsMarkdown(items) || "Por ahora no tengo un ranking de más vendidos.";
       text = maybePrependGreetingTip(text, meta, FREE_TH);
       return res.json({ text });
     }
 
-    const brand = extractBrandOrNull(message || '');
-    if (brand) {
-      const items = await searchByVendor(brand, 5);
+    const brandAsk = message || '';
+    const mBrand = brandAsk.toLowerCase().match(/tienen la marca\s+([a-z0-9&\-\s]+)/i) || brandAsk.toLowerCase().match(/tienen\s+([a-z0-9&\-\s]+)\??$/i);
+    if (mBrand) {
+      const brand = mBrand[1].trim();
+      if (brand.length >= 2 && brand.length <= 40) {
+        const items = await searchByVendor(brand, 5);
+        if (items.length) {
+          let text = buildProductsMarkdown(items);
+          text = maybePrependGreetingTip(text, meta, FREE_TH);
+          return res.json({ text });
+        }
+        const fallback = await searchProductsPlain(brand, 5);
+        if (fallback.length) {
+          let text = buildProductsMarkdown(fallback);
+          text = maybePrependGreetingTip(text, meta, FREE_TH);
+          return res.json({ text });
+        }
+        return res.json({ text: `Sí trabajamos varias marcas. No encontré resultados exactos para "${brand}". ¿Quieres que te sugiera alternativas similares?` });
+      }
+    }
+
+    if (/pasta.*(rosada|pink)|pink.*stuff/i.test(qn)) {
+      const items = await searchProductsPlain('pink stuff pasta multiuso stardrops', 5);
       if (items.length) {
         let text = buildProductsMarkdown(items);
         text = maybePrependGreetingTip(text, meta, FREE_TH);
         return res.json({ text });
       }
-      const fallback = await searchProductsPlain(brand, 5);
-      if (fallback.length) {
-        let text = buildProductsMarkdown(fallback);
+    }
+    if (/pasta.*(original|astonish)|astonish.*pasta/i.test(qn)) {
+      const items = await searchProductsPlain('astonish pasta original multiuso', 5);
+      if (items.length) {
+        let text = buildProductsMarkdown(items);
         text = maybePrependGreetingTip(text, meta, FREE_TH);
         return res.json({ text });
       }
-      return res.json({ text: `Sí trabajamos varias marcas. No encontré resultados exactos para "${brand}". ¿Quieres que te sugiera alternativas similares?` });
     }
-
-    const mapped = synonymQueryOrNull(message || '');
-    if (mapped) {
-      const items = await searchProductsPlain(mapped, 5);
+    if (/ecolog|eco|biodegrad/i.test(qn)) {
+      const items = await searchProductsPlain('ecologico biodegradable eco plant-based', 5);
       if (items.length) {
         let text = buildProductsMarkdown(items);
         text = maybePrependGreetingTip(text, meta, FREE_TH);
@@ -618,7 +642,6 @@ app.post('/chat', async (req, res) => {
     }
 
     // 1 por zona (baño/cocina/horno)
-    const qn = norm(message || '');
     const wantsBano   = /ba[nñ]o/.test(qn);
     const wantsCocina = /cocina/.test(qn);
     const wantsHorno  = /horno/.test(qn);
@@ -685,25 +708,20 @@ app.post('/chat', async (req, res) => {
           const vals = Object.values(options).map(v => String(v).toLowerCase().trim()).filter(Boolean);
           let match = null;
           for (const v of p.variants) {
-            const pack = [v.title, v.option1, v.option2, v.option3]
-              .filter(Boolean).map(s => String(s).toLowerCase().trim());
+            const pack = [v.title, v.option1, v.option2, v.option3].filter(Boolean).map(s => String(s).toLowerCase().trim());
             const ok = vals.every(val => pack.some(piece => piece.includes(val)));
             if (ok) { match = v; break; }
           }
           if (!match) match = p.variants.find(v => v.available) || p.variants[0];
           if (!match) throw new Error('Sin variantes para ' + handle);
           return res.json({
-            toolCalls: [{
-              id: c.id,
-              name: 'addToCartClient',
-              arguments: { variantId: String(match.id), quantity: 1 }
-            }]
+            toolCalls: [{ id: c.id, name: 'addToCartClient', arguments: { variantId: String(match.id), quantity: 1 } }]
           });
         }
       }
     }
 
-    // Fallback 1: búsqueda directa simple
+    // Fallback: búsqueda directa simple
     try {
       const forced = await shopifyStorefrontGraphQL(`
         query ProductSearch($q: String!) {
@@ -718,11 +736,9 @@ app.post('/chat', async (req, res) => {
         text = maybePrependGreetingTip(text, meta, FREE_TH);
         return res.json({ text });
       }
-    } catch (err) {
-      console.warn('Fallback searchProducts failed:', err?.message || err);
-    }
+    } catch (err) { console.warn('Fallback searchProducts failed:', err?.message || err); }
 
-    // Fallback 2: pedir dato extra
+    // Fallback final
     return res.json({
       text: userFirstName
         ? `Gracias, ${userFirstName}. ¿Me das una pista más (marca, superficie, aroma)? También puedo sugerir opciones similares.`
@@ -732,9 +748,7 @@ app.post('/chat', async (req, res) => {
   } catch (e) {
     console.error(e);
     if (e?.code === 'insufficient_quota' || e?.status === 429) {
-      return res.json({
-        text: "Estoy con alto tráfico. Dime qué producto buscas y te paso el enlace para agregarlo al carrito."
-      });
+      return res.json({ text: "Estoy con alto tráfico. Dime qué producto buscas y te paso el enlace para agregarlo al carrito." });
     }
     return res.status(500).json({ error: String(e) });
   }
