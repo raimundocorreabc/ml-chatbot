@@ -10,9 +10,10 @@ const {
   SHOPIFY_STOREFRONT_TOKEN,
   SHOPIFY_PUBLIC_STORE_DOMAIN,
   ALLOWED_ORIGINS,
+  SHOPIFY_API_VERSION,           // <— nuevo (opcional), por defecto 2024-10
   PORT,
 
-  FREE_SHIPPING_THRESHOLD_CLP, // default 40000 (RM)
+  FREE_SHIPPING_THRESHOLD_CLP,
   MUNDOPUNTOS_EARN_PER_CLP,
   MUNDOPUNTOS_REDEEM_PER_100,
   MUNDOPUNTOS_PAGE_URL,
@@ -23,20 +24,46 @@ if (!OPENAI_API_KEY) throw new Error("Falta OPENAI_API_KEY");
 if (!SHOPIFY_STORE_DOMAIN || !SHOPIFY_STOREFRONT_TOKEN) throw new Error("Falta SHOPIFY_STORE_DOMAIN o SHOPIFY_STOREFRONT_TOKEN");
 if (!SHOPIFY_PUBLIC_STORE_DOMAIN) throw new Error("Falta SHOPIFY_PUBLIC_STORE_DOMAIN");
 
-const allowed = (ALLOWED_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean);
-
 const app = express();
 app.use(express.json());
+
+/* -------- CORS: permite por defecto el dominio público del shop -------- */
+const normalizeOrigin = (u) => {
+  try { return new URL(u).origin; } catch { return (u || '').replace(/\/+$/, ''); }
+};
+const defaultAllowed = (() => {
+  try {
+    const o = normalizeOrigin(SHOPIFY_PUBLIC_STORE_DOMAIN);
+    // agrega ambas variantes por si acaso
+    if (/^https?:\/\/www\./i.test(o)) {
+      return [o, o.replace('//www.', '//')];
+    } else {
+      return [o, o.replace('://', '://www.')];
+    }
+  } catch { return []; }
+})();
+const allowedList = (ALLOWED_ORIGINS && ALLOWED_ORIGINS.trim()
+  ? ALLOWED_ORIGINS.split(',').map(s => normalizeOrigin(s.trim()))
+  : defaultAllowed
+).filter(Boolean);
+const allowAll = allowedList.length === 0;
+
 app.use(cors({
-  origin: (origin, cb) => (!origin || allowed.includes(origin)) ? cb(null, true) : cb(new Error('Origen no permitido')),
+  origin: (origin, cb) => {
+    if (allowAll) return cb(null, true);
+    if (!origin)  return cb(null, true); // health checks, curl, etc.
+    const ok = allowedList.includes(normalizeOrigin(origin));
+    return ok ? cb(null, true) : cb(new Error('Origen no permitido: ' + origin));
+  },
   credentials: true
 }));
 
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 
 /* ---------------- Utils ---------------- */
-const BASE = (SHOPIFY_PUBLIC_STORE_DOMAIN || '').replace(/\/$/, '');
+const BASE = normalizeOrigin(SHOPIFY_PUBLIC_STORE_DOMAIN);
 const FREE_TH_DEFAULT = 40000; // RM ≥ $40.000
+const SF_API_VERSION = (SHOPIFY_API_VERSION && SHOPIFY_API_VERSION.trim()) || '2024-10'; // ✅ estable
 
 const fmt = (n) => new Intl.NumberFormat('es-CL', { style:'currency', currency:'CLP', maximumFractionDigits:0 }).format(Math.round(Number(n)||0));
 const norm = (s='') => String(s).normalize('NFD').replace(/[\u0300-\u036f]/g,'').toLowerCase();
@@ -72,34 +99,23 @@ const REGION_COST = (() => {
   return m;
 })();
 
-const REGION_SYNONYMS = [
-  'rm','region metropolitana','región metropolitana'
-].map(fold);
-
-/* helpers para encontrar región/comuna “dentro” del texto */
 function findRegionIn(s='') {
   const f = ' ' + fold(s) + ' ';
   if (/\brm\b/.test(f)) return 'metropolitana';
-  if (f.includes(' region metropolitana ') || f.includes(' region  metropolitana ')) return 'metropolitana';
-  if (f.includes(' region  metropolitana') || f.includes(' region metropolitana')) return 'metropolitana';
-  if (f.includes(' region metropolitana')) return 'metropolitana';
+  if (f.includes(' region metropolitana ')) return 'metropolitana';
   if (f.includes(' santiago ')) return 'metropolitana';
-  for (const r of REGIONES_FOLDED) {
-    if (f.includes(' ' + r + ' ')) return r;
-  }
+  for (const r of REGIONES_FOLDED) if (f.includes(' ' + r + ' ')) return r;
   return null;
 }
 function findComunaIn(s='') {
   const f = ' ' + fold(s) + ' ';
-  for (const c of COMUNAS_RM_FOLDED) {
-    if (f.includes(' ' + c + ' ')) return c;
-  }
+  for (const c of COMUNAS_RM_FOLDED) if (f.includes(' ' + c + ' ')) return c;
   return null;
 }
 
 /* ---------------- Shopify utils ---------------- */
 async function sf(query, variables = {}) {
-  const url = `https://${SHOPIFY_STORE_DOMAIN}/api/2025-07/graphql.json`;
+  const url = `https://${SHOPIFY_STORE_DOMAIN}/api/${SF_API_VERSION}/graphql.json`; // ✅ versión estable
   const r = await fetch(url, {
     method:'POST',
     headers:{
@@ -108,7 +124,10 @@ async function sf(query, variables = {}) {
     },
     body: JSON.stringify({ query, variables })
   });
-  if (!r.ok) throw new Error('Storefront API ' + r.status);
+  if (!r.ok) {
+    const txt = await r.text().catch(()=>String(r.status));
+    throw new Error('Storefront API ' + r.status + ' ' + txt);
+  }
   const data = await r.json();
   if (data.errors) throw new Error(JSON.stringify(data.errors));
   return data.data;
@@ -182,7 +201,7 @@ const tools = [
 
 /* ---------------- Texto helpers ---------------- */
 const buildProductsMarkdown = (items=[]) => items.length
-  ? `Aquí tienes opciones:\n\n${items.map((p,i)=>`${i+1}. **[${(p.title||'Ver producto').replace(/\*/g,'')}**](${BASE}/products/${p.handle}) – agrega al carrito o ver más detalles.`).join('\n')}`
+  ? `Aquí tienes opciones:\n\n${items.map((p,i)=>`${i+1}. **[${(p.title||'Ver producto').replace(/\*/g,'')}](${BASE}/products/${p.handle})** – agrega al carrito o ver más detalles.`).join('\n')}`
   : null;
 
 const stripAndTrim = (s='') => String(s).replace(/<[^>]+>/g,' ').replace(/\s+/g,' ').trim();
@@ -197,7 +216,7 @@ function maybePrependGreetingTip(text, meta, FREE_TH){
   return `TIP: Hola, ${name} 👋${extra}\n\n${text}`;
 }
 
-/* Carrusel de marcas (personalizable) */
+/* Carrusel de marcas */
 const parseBrands = () => { try { return JSON.parse(BRAND_CAROUSEL_JSON||''); } catch { return []; } };
 const buildBrandsPayload = (arr=[]) => {
   const rows = arr.map(b=>{
@@ -255,21 +274,18 @@ function shippingInfoBlock(FREE_TH){
 async function faqAnswerOrNull(message='', meta={}){
   const raw = (message||'').trim();
 
-  // Si viene “envío <lugar> …”, tomamos solo lo que sigue
+  // Prefijo "envío ..."
   const mPref = raw.match(/^(env[ií]o|envio|despacho|retiro)\s+(.+)$/i);
   const query = mPref ? mPref[2] : raw;
 
   const FREE_TH = Number(FREE_SHIPPING_THRESHOLD_CLP ?? FREE_TH_DEFAULT);
 
-  // Detectar región/comuna dentro del query
-  const regionFound = findRegionIn(query);                // 'metropolitana', 'los lagos', etc.
-  const comunaFound = findComunaIn(query);                // 'las condes', etc.
+  const regionFound = findRegionIn(query);
+  const comunaFound = findComunaIn(query);
   const regionFromComuna = comunaFound ? COMUNA_REGION_MAP.get(comunaFound) : null;
   const regionKey = regionFound || regionFromComuna || null;
 
-  // Responder por casos
   if (regionKey && comunaFound) {
-    // Tenemos región y comuna
     const info = REGION_COST.get(regionKey);
     const comunaNice = COMUNAS_RM.find(c => fold(c)===comunaFound) || comunaFound;
     const regNice = REGIONES.find(r => fold(r)===regionKey) || regionKey;
@@ -282,7 +298,6 @@ async function faqAnswerOrNull(message='', meta={}){
   }
 
   if (regionKey && !comunaFound) {
-    // Solo región
     const regNice = REGIONES.find(r => fold(r)===regionKey) || regionKey;
     const info = REGION_COST.get(regionKey);
     const parts = [];
@@ -295,7 +310,6 @@ async function faqAnswerOrNull(message='', meta={}){
   }
 
   if (!regionKey && comunaFound) {
-    // Solo comuna (de las listadas → RM)
     const comunaNice = COMUNAS_RM.find(c => fold(c)===comunaFound) || comunaFound;
     const info = REGION_COST.get('metropolitana');
     const parts = [
@@ -306,17 +320,14 @@ async function faqAnswerOrNull(message='', meta={}){
     return parts.join(' ');
   }
 
-  // genérico de envíos (incluye “¿sobre cuánto tengo envío gratis?”)
   if (/(env[ií]o|envio|despacho|retiro|gratis|minimo|m[ií]nimo)/i.test(raw)) {
     return shippingInfoBlock(FREE_TH);
   }
 
-  // checkout cupón
   if (/(donde|en que parte|cómo|como).*(checkout|pago|carro|carrito).*(cupon|cup[oó]n|c[oó]digo de descuento|codigo de descuento)/i.test(raw)) {
     return `En el **checkout** verás el campo **“Código de descuento o tarjeta de regalo”**. Pega tu cupón y presiona **Aplicar**. Si es un cupón de **Mundopuntos**, primero géneralo en el **widget de recompensas** y luego cópialo ahí.`;
   }
 
-  // ¿Qué es/qué venden? → categorías como botones
   if (/(que es|qué es|quienes son|quiénes son).*(mundolimpio|mundo limpio)|que venden en mundolimpio|que productos venden\??$/i.test(raw)) {
     const cols = await listCollections(8);
     if (!cols.length) return `**MundoLimpio.cl** es una tienda chilena de limpieza/hogar premium.`;
@@ -324,7 +335,6 @@ async function faqAnswerOrNull(message='', meta={}){
     return `CATS:\n${payload}`;
   }
 
-  // ¿Marcas? → usa carrusel configurado o vendors
   if (/(que|qué)\s+marcas.*venden|marcas\s*(disponibles|que tienen|venden)/i.test(raw)) {
     const custom = parseBrands();
     if (custom.length) {
@@ -338,35 +348,31 @@ async function faqAnswerOrNull(message='', meta={}){
     return payload || `Trabajamos marcas como: **${vendors.join('**, **')}**. ¿Buscas alguna en particular?`;
   }
 
-  // tipos de productos → categorías como botones
-  if (/(que|qué)\s+tipos\s+de\s+productos\s+venden|categor[ií]as|secciones|colecciones/i.test(raw)) {
+  if ((/(que|qué)\s+tipos\s+de\s+productos\s+venden|categor[ií]as|secciones|colecciones/i).test(raw)) {
     const cols = await listCollections(10);
     if (!cols.length) return 'Tenemos múltiples categorías: cocina, baño, pisos, lavandería, superficies, accesorios y más.';
     const payload = cols.map(c => `${c.title}|${BASE}/collections/${c.handle}`).join('\n');
     return `CATS:\n${payload}`;
   }
 
-  // Tips temáticos
   if (/vitrocer[aá]mica|vitro\s*cer[aá]mica/i.test(raw)) return await tipVitro();
   if (/alfombra(s)?/i.test(raw)) return await tipAlfombra();
   if (/cortina(s)?/i.test(raw)) return await tipCortina();
   if (/olla.*quemad/i.test(raw)) return await tipOlla();
   if (/sill[oó]n|sofa|sof[aá]|tapiz/i.test(raw)) return await tipSillon();
 
-  // Mundopuntos
   if (/mundopuntos|puntos|fidelizaci[óo]n/i.test(raw)) {
     const earn = Number(MUNDOPUNTOS_EARN_PER_CLP || 1);
     const redeem100 = Number(MUNDOPUNTOS_REDEEM_PER_100 || 3);
     const url = (MUNDOPUNTOS_PAGE_URL || '').trim();
     return [
       `**Mundopuntos**: ganas **${earn} punto(s) por cada $1** que gastes.`,
-      `El canje es **100 puntos = ${fmt(redeem100)}** (≈ ${(redeem100/100*100).toFixed(0)}% de retorno).`,
+      `El canje es **100 puntos = ${fmt(redeem100)}**.`,
       `Puedes canjear en el **checkout** ingresando tu cupón.`,
       url ? `Más info: ${url}` : `También puedes ver y canjear tus puntos en el **widget de recompensas**.`
     ].join(' ');
   }
 
-  // Hongos baño breve + productos
   if (/(hongo|moho).*(baño|ducha|tina)|sacar los hongos|sacar hongos/i.test(raw)) {
     const list = buildProductsMarkdown(await searchMulti(['antihongos baño','antihongos interior','moho ducha'],3));
     const tip = ['Baño con hongos — rápido:','1) Ventila y usa guantes.','2) Aplica antihongos 5–10 min.','3) Cepilla, enjuaga y seca.'].join('\n');
@@ -383,7 +389,6 @@ app.post('/chat', async (req, res) => {
     const userFirstName = (meta.userFirstName || '').trim();
     const FREE_TH = Number(FREE_SHIPPING_THRESHOLD_CLP ?? FREE_TH_DEFAULT);
 
-    // Post-tool
     if (toolResult?.id) {
       const r = await openai.chat.completions.create({
         model: 'gpt-4o-mini',
@@ -397,14 +402,14 @@ app.post('/chat', async (req, res) => {
 
     const intent = detectIntent(message || '');
 
-    /* ===== INFO / FAQ ===== */
     if (intent === 'info') {
       const faq = await faqAnswerOrNull(message || '', meta);
       if (faq) return res.json({ text: maybePrependGreetingTip(faq, meta, FREE_TH) });
 
-      // Producto relacionado (resumen corto)
-      const d = await sf(`query($q:String!){ search(query:$q, types:PRODUCT, first:1){ edges{ node{ ... on Product{ title handle } } } } }`,
-        { q: String(message||'').slice(0,120) });
+      const d = await sf(
+        `query($q:String!){ search(query:$q, types:PRODUCT, first:1){ edges{ node{ ... on Product{ title handle } } } } }`,
+        { q: String(message||'').slice(0,120) }
+      );
       const node = d?.search?.edges?.[0]?.node;
       if (node?.handle) {
         const detail = await getProductDetailsByHandle(node.handle);
@@ -416,7 +421,6 @@ app.post('/chat', async (req, res) => {
         return res.json({ text });
       }
 
-      // Consejos compactos por IA
       const ai = await openai.chat.completions.create({
         model: 'gpt-4o-mini',
         messages: [
@@ -434,7 +438,6 @@ app.post('/chat', async (req, res) => {
       return res.json({ text: maybePrependGreetingTip(ai.choices[0].message.content, meta, FREE_TH) });
     }
 
-    /* ===== Hooks previos (browse/buy) ===== */
     const f = fold(message||'');
     if (/(mas vendidos|más vendidos|best sellers|top ventas|lo mas vendido|lo más vendido)/.test(f)) {
       const items = await listTopSellers(5);
@@ -479,7 +482,6 @@ app.post('/chat', async (req, res) => {
       }
     }
 
-    /* ===== Browse/buy con tools ===== */
     const r = await openai.chat.completions.create({
       model:'gpt-4o-mini',
       tools, tool_choice:'auto',
@@ -524,7 +526,7 @@ app.post('/chat', async (req, res) => {
       }
     }
 
-    // Fallback: búsqueda simple
+    // Fallback
     try {
       const d = await sf(`query($q:String!){ search(query:$q, types:PRODUCT, first:5){ edges{ node{ ... on Product{ title handle } } } } }`, { q: String(message||'').slice(0,120) });
       const items = (d.search?.edges||[]).map(e=>({ title:e.node.title, handle:e.node.handle }));
@@ -547,3 +549,4 @@ app.get('/health', (_, res) => res.json({ ok: true }));
 
 const port = PORT || process.env.PORT || 3000;
 app.listen(port, () => console.log('ML Chat server on :' + port));
+
