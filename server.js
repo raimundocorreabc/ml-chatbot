@@ -26,14 +26,7 @@ if (!OPENAI_API_KEY) throw new Error("Falta OPENAI_API_KEY");
 if (!SHOPIFY_STORE_DOMAIN || !SHOPIFY_STOREFRONT_TOKEN) throw new Error("Falta SHOPIFY_STORE_DOMAIN o SHOPIFY_STOREFRONT_TOKEN");
 if (!SHOPIFY_PUBLIC_STORE_DOMAIN) throw new Error("Falta SHOPIFY_PUBLIC_STORE_DOMAIN");
 
-// CORS
-const allowed = (ALLOWED_ORIGINS || '')
-  .split(',')
-  .map(s => s.trim())
-  .filter(Boolean);
-
-// Asegura incluir tu dominio público de Shopify
-// p.ej: https://tienda.myshopify.com o https://www.mundolimpio.cl
+const allowed = (ALLOWED_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean);
 
 const app = express();
 app.use(express.json());
@@ -52,61 +45,27 @@ function formatCLP(n) {
   const v = Math.round(Number(n) || 0);
   return new Intl.NumberFormat('es-CL', { style: 'currency', currency: 'CLP', maximumFractionDigits: 0 }).format(v);
 }
-function titleCase(s) { return String(s||'').toLowerCase().replace(/\b\w/g, m => m.toUpperCase()); }
+function titleCaseComuna(s) { return String(s||'').toLowerCase().replace(/\b\w/g, m => m.toUpperCase()); }
+
 function norm(s=''){ return String(s).normalize('NFD').replace(/[\u0300-\u036f]/g,'').toLowerCase(); }
 function fold(s=''){ return norm(s).replace(/ñ/g,'n'); }
 
-/* ---------------- Regiones/comunas (intención “envío”) ---------------- */
-// Canonical (para matching flexible tipo “includes”)
-const REGION_CANON = [
+/* ---------------- Regiones y comunas (para intención "envío") ---------------- */
+const REGIONES = [
   'arica y parinacota','tarapaca','antofagasta','atacama','coquimbo','valparaiso',
   'metropolitana','santiago',"o'higgins",'ohiggins','maule','nuble','biobio',
   'la araucania','araucania','los rios','los lagos','aysen','magallanes'
 ];
+const REGIONES_FOLDED = new Set(REGIONES.map(fold));
 
-// Función robusta: encuentra una región dentro de un texto en español (RM, “región de …”, etc.)
-function findRegionInText(text='') {
-  const f = ' ' + fold(text) + ' ';
-
-  // Abreviatura/alias RM
-  if (/\brm\b/.test(f) || f.includes(' region metropolitana ') || f.includes(' region metropolitana de santiago ')) {
-    return 'metropolitana';
-  }
-
-  // “Santiago” lo consideramos RM
-  if (f.includes(' santiago ')) return 'metropolitana';
-
-  // “región de X” o “region X” o nombre suelto
-  for (const canon of REGION_CANON) {
-    if (
-      f.includes(' ' + canon + ' ') ||
-      f.includes(' region ' + canon + ' ') ||
-      f.includes(' region de ' + canon + ' ')
-    ) return canon;
-  }
-  return null;
-}
-
-// Un set pequeño de comunas frecuentes (para mejorar heurística)
-// Si quieres, puedes ampliarlo, pero si no se reconoce pedimos región para confirmar.
-const COMUNAS_POP = [
-  'las condes','vitacura','lo barnechea','providencia','ñuñoa','la reina','santiago',
-  'macul','la florida','puente alto','maipú','maipu','huechuraba','independencia','recoleta','quilicura',
-  'conchalí','conchali','san miguel','san joaquín','san joaquin','la cisterna','san bernardo','colina','buin','lampa'
+const COMUNAS = [
+  'las condes','vitacura','lo barnechea','providencia','ñuñoa','la reina','peñalolén','santiago',
+  'macul','la florida','puente alto','maipú','huechuraba','independencia','recoleta','quilicura',
+  'conchalí','san miguel','san joaquín','la cisterna','san bernardo','colina','buin','lampa'
 ];
-function findComunaInText(text='') {
-  const f = ' ' + fold(text) + ' ';
-  for (const c of COMUNAS_POP) {
-    const cf = ' ' + fold(c) + ' ';
-    if (f.includes(cf)) return c;
-  }
-  // patrón “comuna de X” (heurístico)
-  const m = f.match(/\bcomuna(?:\s+de)?\s+([a-z\s]{3,30})\b/);
-  if (m && m[1] && !m[1].includes('region')) return m[1].trim();
-  return null;
-}
+const COMUNAS_FOLDED = new Set(COMUNAS.map(fold));
 
-/* ---------------- Tarifas de envío por zona ---------------- */
+/* ---------------- Tarifas de envío por zona (según lo que indicaste) ---------------- */
 const SHIPPING_ZONES = [
   { zone: 'REGIÓN METROPOLITANA', cost: 3990,  regions: ['Metropolitana','Santiago'] },
   { zone: 'ZONA CENTRAL',         cost: 6990,  regions: ['Coquimbo','Valparaíso','Valparaiso',"O’Higgins","O'Higgins",'Maule','Ñuble','Nuble','Biobío','Biobio','Araucanía','Araucania','Los Ríos','Los Rios','Los Lagos'] },
@@ -115,9 +74,7 @@ const SHIPPING_ZONES = [
 ];
 const REGION_COST_MAP = (() => {
   const m = new Map();
-  for (const z of SHIPPING_ZONES)
-    for (const r of z.regions)
-      m.set(fold(r), { zone: z.zone, cost: z.cost });
+  for (const z of SHIPPING_ZONES) for (const r of z.regions) m.set(fold(r), { zone: z.zone, cost: z.cost });
   m.set('metropolitana', { zone: 'REGIÓN METROPOLITANA', cost: 3990 });
   m.set('santiago',      { zone: 'REGIÓN METROPOLITANA', cost: 3990 });
   return m;
@@ -145,7 +102,7 @@ async function shopifyStorefrontGraphQL(query, variables = {}) {
 
 async function getProductJsonByHandle(handle) {
   const url = `${BASE}/products/${handle}.js`;
-  const r = await fetch(url, { cache: 'no-store' });
+  const r = await fetch(url);
   if (!r.ok) throw new Error('No se pudo leer ' + url);
   return r.json();
 }
@@ -197,6 +154,7 @@ async function searchByVendor(vendor, first = 5) {
   return (data.products?.edges || []).map(e => ({ title: e.node.title, handle: e.node.handle }));
 }
 
+/* --- vendors y colecciones --- */
 async function listVendors(limit = 20) {
   const data = await shopifyStorefrontGraphQL(`
     query Vendors {
@@ -220,25 +178,31 @@ async function listCollections(limit = 10) {
   return (data.collections?.edges || []).map(e => ({ title: e.node.title, handle: e.node.handle }));
 }
 
-async function recommendZoneProducts(zones = []) {
-  const queries = {
-    'baño':   ['antihongos baño', 'astonish baño 750', 'limpiador baño'],
-    'cocina': ['desengrasante cocina', 'cif crema', 'astonish kitchen'],
-    'horno':  ['astonish horno', 'goo gone bbq', 'weiman cook top']
+/* ---------------- Recos por zona (mejorado: más picks) ---------------- */
+async function recommendZoneProducts(zones = [], wantedPerZone = 3, maxTotal = 6) {
+  const seeds = {
+    'baño':   ['antihongos baño', 'sanytol baño', 'harpic', 'cif baño', 'limpiador baño', 'moho ducha'],
+    'cocina': ['desengrasante cocina', 'kh-7', 'cif crema', 'goo gone', 'weiman cook top', 'degreaser'],
+    'horno':  ['astonish horno', 'goo gone bbq', 'weiman cook top', 'grill limpiador', 'desengrasante horno']
   };
-  const picks = [];
   const seen = new Set();
+  const pool = [];
   for (const z of zones) {
-    const qs = queries[z] || [];
-    let found = null;
+    const qs = seeds[z] || [];
     for (const q of qs) {
-      const items = await searchProductsPlain(q, 2);
-      const it = items.find(i => !seen.has(i.handle));
-      if (it) { found = it; break; }
+      const items = await searchProductsPlain(q, 6);
+      for (const it of items) {
+        if (!seen.has(it.handle)) {
+          seen.add(it.handle);
+          pool.push(it);
+          if (pool.length >= maxTotal) break;
+        }
+      }
+      if (pool.length >= maxTotal) break;
     }
-    if (found) { picks.push(found); seen.add(found.handle); }
   }
-  return picks;
+  // Prefiere stock entre los recogidos
+  return await preferInStock(pool, Math.min(maxTotal, zones.length * wantedPerZone));
 }
 
 /* ---------------- Tools de IA ---------------- */
@@ -289,6 +253,7 @@ function buildProductsMarkdown(items = []) {
   });
   return `Aquí tienes opciones:\n\n${lines.join('\n')}`;
 }
+
 function stripAndTrim(s = '') {
   return String(s).replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
 }
@@ -319,22 +284,176 @@ function buildBrandsPayload(brands = []) {
   return rows.length ? `BRANDS:\n${rows.join('\n')}` : null;
 }
 
+/* ==================== NUEVO: utilidades para mejores recos ==================== */
+
+/* ---------- STOCK / PREFERENCIAS ---------- */
+async function productAvailableForSale(handle){
+  const d = await shopifyStorefrontGraphQL(`
+    query($h:String!){ product(handle:$h){ availableForSale } }
+  `, { h: handle });
+  return !!d.product?.availableForSale;
+}
+
+async function markAvailability(items){
+  const checks = await Promise.all(items.map(it =>
+    productAvailableForSale(it.handle).catch(()=>false)
+  ));
+  return items.map((it,i)=>({...it, inStock: checks[i]}));
+}
+
+async function preferInStock(items, need){
+  const marked = await markAvailability(items);
+  const inStock = marked.filter(x=>x.inStock);
+  const rest    = marked.filter(x=>!x.inStock);
+  return inStock.concat(rest).slice(0, need).map(({inStock, ...p})=>p);
+}
+
+/* ---------- KEYWORDS desde la consulta del cliente ---------- */
+const ES_STOPWORDS = new Set([
+  'el','la','los','las','un','una','unos','unas','de','del','al','a','en','y','o','u','para',
+  'por','con','sin','que','qué','cual','cuál','como','cómo','donde','dónde','sobre','mi','mis',
+  'tu','tus','su','sus','lo','le','les','me','te','se','es','son','ser','estar','hay',
+  'quiero','necesito','me','puedes','recomendar','recomendacion','recomendación','productos',
+  'producto','limpiar','limpieza','comprar','ayuda','debo','deberia','debería'
+].map(s=>s.normalize('NFD').replace(/[\u0300-\u036f]/g,'').toLowerCase()));
+
+function extractKeywords(text='', max=6){
+  const tokens = String(text||'')
+    .normalize('NFD').replace(/[\u0300-\u036f]/g,'')
+    .toLowerCase()
+    .replace(/[^a-z0-9áéíóúüñ\s]/gi,' ')
+    .split(/\s+/)
+    .filter(Boolean);
+
+  const bag = [];
+  const seen = new Set();
+  for (const t of tokens) {
+    if (t.length < 3) continue;
+    const base = t.replace(/s$/,''); // plural simple
+    if (ES_STOPWORDS.has(base)) continue;
+    if (seen.has(base)) continue;
+    seen.add(base);
+    bag.push(base);
+    if (bag.length >= max) break;
+  }
+  return bag;
+}
+
+/* ---------- “Si palabra del cliente está en el título, sugiérelo” ---------- */
+async function titleMatchProducts(queryText, max=5){
+  const pool = await searchProductsPlain(String(queryText||'').slice(0,120), 20);
+  if (!pool.length) return [];
+
+  const kws = extractKeywords(queryText, 8);
+  if (!kws.length) return pool.slice(0, max);
+
+  const fld = s => String(s||'').normalize('NFD').replace(/[\u0300-\u036f]/g,'').toLowerCase();
+  const scored = pool.map(p => {
+    const t = fld(p.title);
+    const hits = kws.reduce((n,kw)=> n + (t.includes(kw) ? 1 : 0), 0);
+    return { ...p, _hits: hits };
+  });
+
+  const byHits = scored.sort((a,b)=> b._hits - a._hits).filter(x=>x._hits > 0).slice(0, max*2);
+  if (!byHits.length) return pool.slice(0, max);
+
+  return await preferInStock(byHits, max);
+}
+
+/* ---------- N° solicitado en texto (“5 productos”, “cinco”) ---------- */
+const NUM_WORDS_ES = { dos:2, tres:3, cuatro:4, cinco:5, seis:6, siete:7, ocho:8, nueve:9, diez:10 };
+function parseRequestedCount(text, def=4){
+  const m = String(text||'').match(/\b(\d{1,2})\b/);
+  if (m) { const n = parseInt(m[1],10); if (n>=2 && n<=10) return n; }
+  const mw = String(text||'').toLowerCase().match(new RegExp('\\b(' + Object.keys(NUM_WORDS_ES).join('|') + ')\\b','i'));
+  if (mw) return NUM_WORDS_ES[mw[1].toLowerCase()];
+  return def;
+}
+
+/* ==================== TIPS concisos + productos (clásicos) ==================== */
+async function tipVitro() {
+  const tip = [
+    'Vitrocerámica — pasos rápidos:',
+    '1) Con la placa fría, retira residuos con rasqueta plástica.',
+    '2) Aplica crema específica, deja actuar 1–2 min.',
+    '3) Pasa microfibra; repite en manchas quemadas.',
+    '4) Termina con protector/abrillantador si quieres más brillo.'
+  ].join('\n');
+  const items = await searchMulti(['weiman vitroceramica crema', 'weiman cook top kit', 'astonish vitroceramica'], 3);
+  const list = buildProductsMarkdown(items);
+  return list ? `TIP: ${tip}\n\n${list}` : `TIP: ${tip}`;
+}
+
+async function tipAlfombra() {
+  const tip = [
+    'Alfombra — limpieza básica:',
+    '1) Aspira a fondo (pasadas cruzadas).',
+    '2) Prueba el producto en zona oculta.',
+    '3) Aplica limpiador de alfombras, cepilla suave y retira.',
+    '4) Seca con ventilación; repite si persiste la mancha.'
+  ].join('\n');
+  const items = await searchMulti(['alfombra limpiador', 'tapicerias astonish', 'protector textil'], 3);
+  const list = buildProductsMarkdown(items);
+  return list ? `TIP: ${tip}\n\n${list}` : `TIP: ${tip}`;
+}
+
+async function tipCortina() {
+  const tip = [
+    'Cortina tela — cuidado rápido:',
+    '1) Aspira el polvo con boquilla suave.',
+    '2) Trata manchas puntuales con quitamanchas de telas.',
+    '3) Lava según etiqueta o limpieza en seco.',
+    '4) Protege con spray textil anti manchas si es habitual.'
+  ].join('\n');
+  const items = await searchMulti(['quitamanchas tela', 'protector textil', 'limpiador telas'], 3);
+  const list = buildProductsMarkdown(items);
+  return list ? `TIP: ${tip}\n\n${list}` : `TIP: ${tip}`;
+}
+
+async function tipOllaQuemada() {
+  const tip = [
+    'Olla quemada — cómo salvarla:',
+    '1) Cubre fondo con agua + bicarbonato (o vinagre).',
+    '2) Hierve 5 min y enfría; desprende con espátula.',
+    '3) Usa pasta desengrasante y enjuaga.',
+    '4) En acero inox, termina con limpiador específico.'
+  ].join('\n');
+  const items = await searchMulti(['pink stuff pasta 850', 'astonish vitroceramica kit', 'weiman acero inoxidable 710'], 3);
+  const list = buildProductsMarkdown(items);
+  return list ? `TIP: ${tip}\n\n${list}` : `TIP: ${tip}`;
+}
+
+async function tipSillon() {
+  const tip = [
+    'Sillón/tapiz — rutina corta:',
+    '1) Aspira bien.',
+    '2) Prueba en zona oculta.',
+    '3) Aplica limpiador de telas y retira con microfibra.',
+    '4) Opción: protector textil anti manchas.'
+  ].join('\n');
+  const items = await searchMulti(['limpiador tela sofa', 'protector textil', 'quitamanchas tapiz'], 3);
+  const list = buildProductsMarkdown(items);
+  return list ? `TIP: ${tip}\n\n${list}` : `TIP: ${tip}`;
+}
+
 /* ---------------- Intent ---------------- */
 function detectIntent(text = '') {
   const qFold = fold((text || '').trim());
+  const isComunaOnly = COMUNAS_FOLDED.has(qFold);
+  const isRegionOnly = REGIONES_FOLDED.has(qFold);
+
   const infoTriggers = [
     'para que sirve','como usar','instrucciones','modo de uso','ingredientes','composicion',
-    'sirve para','usos','beneficios','caracteristicas','consejos','tips','que es',
-    'envio','envío','despacho','retiro','gratis','costo de envio','envio gratis',
+    'sirve para','usos','beneficios','caracteristicas','como puedo','como sacar','como limpiar',
+    'consejos','tips','que es','envio','despacho','retiro','gratis','costo de envio','envio gratis',
     'mundopuntos','puntos','fidelizacion','checkout','cupon','codigo de descuento',
     'marcas venden','tipos de productos','que productos venden','que venden'
   ];
   const buyTriggers = ['comprar','agrega','agregar','añade','añadir','carrito','precio','recomiend'];
 
-  // Nuevo: si el texto contiene alguna región/comuna conocida, trátalo como “info” (envío)
-  if (findRegionInText(text) || findComunaInText(text)) return 'info';
-  if (infoTriggers.some(t => qFold.includes(fold(t)))) return 'info';
-  if (buyTriggers.some(t => qFold.includes(fold(t)))) return 'buy';
+  if (isComunaOnly || isRegionOnly) return 'info';
+  if (infoTriggers.some(t => qFold.includes(t))) return 'info';
+  if (buyTriggers.some(t => qFold.includes(t))) return 'buy';
   return 'browse';
 }
 
@@ -355,56 +474,51 @@ async function searchMulti(queries = [], max = 5) {
   return picks;
 }
 
-/* ==================== FAQ/guías (envíos + varios) ==================== */
+/* ==================== FAQ/guías (async) ==================== */
 async function faqAnswerOrNull(message = '', meta = {}) {
   const raw = (message || '').trim();
 
-  // Si el front envió "envío <lugar>", extraemos <lugar>; si no, usamos el texto tal cual.
+  // Si el front envió "envío <región|comuna>", extraemos solo el lugar:
   const mPref = raw.match(/^(env[ií]o|envio|despacho|retiro)\s+(.+)$/i);
   const locationOnly = mPref ? mPref[2] : raw;
+  const qFold = fold(locationOnly);
 
   const FREE_TH = Number(FREE_SHIPPING_THRESHOLD_CLP ?? FREE_TH_DEFAULT);
   const destinosUrl = `${BASE}/pages/destinos-disponibles-en-chile`;
 
-  // Detecciones robustas
-  const regionFound = findRegionInText(locationOnly); // ej: "rm" → "metropolitana"
-  const comunaFound = findComunaInText(locationOnly); // ej: "en la comuna de la florida" → "la florida"
-
-  // --- Región detectada ---
-  if (regionFound) {
-    const ship = shippingByRegionName(regionFound);
-    const isRM = regionFound === 'metropolitana';
+  // Región sola → costo referencial + recordatorio RM
+  if (REGIONES_FOLDED.has(qFold)) {
+    const regNice = REGIONES.find(r => fold(r) === qFold) || locationOnly;
+    const ship = shippingByRegionName(regNice);
+    const isRM = /metropolitana|santiago/.test(qFold);
     let parts = [];
-
     if (ship) {
-      const niceRegion = titleCase(regionFound.replace(/^la\s+/,'La '));
-      const comunaBit = comunaFound ? `, comuna **${titleCase(comunaFound)}**` : '';
-      parts.push(`Para **${niceRegion}**${comunaBit} (${ship.zone}), el costo referencial es **${formatCLP(ship.cost)}**.`);
+      parts.push(`Para **${titleCaseComuna(regNice)}** (${ship.zone}), el costo referencial es **${formatCLP(ship.cost)}**.`);
     } else {
-      parts.push(`Para tu región el costo se calcula en el **checkout** según **región/comuna** y peso.`);
+      parts.push(`Para **${titleCaseComuna(regNice)}**, el costo se calcula en el checkout según **región/comuna** y peso.`);
     }
-
     if (isRM && FREE_TH > 0) {
       parts.push(`En **RM** ofrecemos **envío gratis** sobre **${formatCLP(FREE_TH)}** (bajo ese monto: ${formatCLP(3990)}).`);
     }
-    parts.push(`📦 Frecuencias/zonas: ${destinosUrl}`);
+    parts.push(`📦 Frecuencias por zona: ${destinosUrl}`);
     return parts.join(' ');
   }
 
-  // --- Solo comuna detectada ---
-  if (comunaFound) {
-    const comunaNice = titleCase(comunaFound);
-    return `Hacemos despacho a **todo Chile**. Para **${comunaNice}**, el costo se calcula automáticamente en el **checkout** al ingresar **región y comuna**. Si me confirmas la **región**, te digo el costo referencial. 📦 Frecuencias: ${destinosUrl}`;
+  // Comuna sola
+  if (COMUNAS_FOLDED.has(qFold)) {
+    const idx = COMUNAS.findIndex(c => fold(c) === qFold);
+    const comunaNice = idx >= 0 ? titleCaseComuna(COMUNAS[idx]) : titleCaseComuna(locationOnly);
+    return `Hacemos despacho a **todo Chile**. Para **${comunaNice}**, el costo se calcula automáticamente en el checkout al ingresar **región y comuna**. Si me confirmas la **región**, puedo darte el costo referencial. 📦 Frecuencias: ${destinosUrl}`;
   }
 
-  // --- Pregunta genérica de envíos ---
+  // ENVÍOS genérico (incluye “¿sobre cuánto tengo envío gratis?”)
   if (/(env[ií]o|envio|despacho|retiro)/i.test(raw)) {
     const header = FREE_TH > 0
       ? `En la **Región Metropolitana (RM)** ofrecemos **envío gratis** en compras sobre **${formatCLP(FREE_TH)}**.`
       : `Hacemos despacho a **todo Chile**.`;
-    const para2 = `Para pedidos bajo ese monto en RM, y para **todas las regiones**, el costo se calcula automáticamente en el **checkout** según **región y comuna**.`;
-    const para3 = `Si me indicas tu **región** y **comuna**, te confirmo el **costo** y la **frecuencia** en tu zona.`;
-    const para4 = `📦 Frecuencias: ${destinosUrl}`;
+    const para2 = `Para pedidos bajo ese monto en la RM, y para **todas las regiones**, el costo de envío se calcula automáticamente en el **checkout** según la **región y comuna** de destino.`;
+    const para3 = `Si me indicas tu **región** y **comuna**, puedo confirmarte el **costo** y la **frecuencia de entrega** en tu zona.`;
+    const para4 = `📦 Frecuencias de entrega: ${destinosUrl}`;
     const tarifas =
       `Tarifas referenciales por región:\n` +
       `- **RM**: ${formatCLP(3990)}\n` +
@@ -423,7 +537,7 @@ async function faqAnswerOrNull(message = '', meta = {}) {
     ].join(' ');
   }
 
-  // ¿Qué es ML / Qué venden? → categorías
+  // ¿Qué es Mundo Limpio? / ¿Qué venden? → categorías como botones
   if (/(que es|qué es|quienes son|quiénes son).*(mundolimpio|mundo limpio)|que venden en mundolimpio|que productos venden\??$/i.test(raw)) {
     const cols = await listCollections(8);
     if (!cols.length) return `**MundoLimpio.cl** es una tienda chilena de limpieza/hogar premium.`;
@@ -431,7 +545,7 @@ async function faqAnswerOrNull(message = '', meta = {}) {
     return `CATS:\n${payload}`;
   }
 
-  // ¿Qué marcas venden? → carrusel
+  // ¿Qué MARCAS venden? → carrusel
   if (/(que|qué)\s+marcas.*venden|marcas\s*(disponibles|que tienen|venden)/i.test(raw)) {
     const custom = parseBrandCarouselConfig();
     if (custom.length) {
@@ -449,7 +563,7 @@ async function faqAnswerOrNull(message = '', meta = {}) {
     return payload || `Trabajamos marcas como: **${vendors.join('**, **')}**. ¿Buscas alguna en particular?`;
   }
 
-  // ¿Qué tipos/categorías venden? → categorías
+  // ¿Qué TIPOS de productos venden? → categorías como botones
   if (/(que|qué)\s+tipos\s+de\s+productos\s+venden|categor[ií]as|secciones|colecciones/i.test(raw)) {
     const cols = await listCollections(10);
     if (!cols.length) return 'Tenemos múltiples categorías: cocina, baño, pisos, lavandería, superficies, accesorios y más.';
@@ -457,42 +571,38 @@ async function faqAnswerOrNull(message = '', meta = {}) {
     return `CATS:\n${payload}`;
   }
 
-  // Tips + recomendaciones rápidas
-  if (/vitrocer[aá]mica|vitro\s*cer[aá]mica/i.test(raw)) {
-    const tip = [
-      'Vitrocerámica — pasos rápidos:',
-      '1) Con la placa fría, rasqueta plástica.',
-      '2) Aplica crema específica 1–2 min.',
-      '3) Microfibra y repite en manchas.',
-      '4) Finaliza con protector si quieres brillo.'
-    ].join('\n');
-    const items = await searchMulti(['weiman vitroceramica crema', 'weiman cook top kit', 'astonish vitroceramica'], 3);
-    const list = buildProductsMarkdown(items);
-    return list ? `TIP: ${tip}\n\n${list}` : `TIP: ${tip}`;
+  // Temas específicos con TIP + productos
+  if (/vitrocer[aá]mica|vitro\s*cer[aá]mica/i.test(raw)) return await tipVitro();
+  if (/alfombra(s)?/i.test(raw)) return await tipAlfombra();
+  if (/cortina(s)?/i.test(raw)) return await tipCortina();
+  if (/olla.*quemad/i.test(raw)) return await tipOllaQuemada();
+  if (/sill[oó]n|sofa|sof[aá]|tapiz/i.test(raw)) return await tipSillon();
+
+  // MUNDOPUNTOS
+  if (/mundopuntos|puntos|fidelizaci[óo]n/i.test(raw)) {
+    const earn = Number(MUNDOPUNTOS_EARN_PER_CLP || 1);
+    const redeem100 = Number(MUNDOPUNTOS_REDEEM_PER_100 || 3);
+    const url = (MUNDOPUNTOS_PAGE_URL || '').trim();
+
+    const parts = [
+      `**Mundopuntos**: ganas **${earn} punto(s) por cada $1** que gastes.`,
+      `El canje es **100 puntos = ${formatCLP(redeem100)}** (≈ ${(redeem100/100*100).toFixed(0)}% de retorno).`,
+      `Puedes canjear en el **checkout** ingresando tu cupón.`
+    ];
+    if (url) parts.push(`Más info: ${url}`);
+    else     parts.push(`También puedes ver y canjear tus puntos en el **widget de recompensas** en la tienda.`);
+    return parts.join(' ');
   }
 
-  if (/alfombra(s)?/i.test(raw)) {
+  // HONGOS/moho genérico breve
+  if (/(hongo|moho).*(baño|ducha|tina)|sacar los hongos|sacar hongos/i.test(raw)) {
+    const items = await searchMulti(['antihongos baño', 'antihongos interior', 'moho ducha'], 3);
     const tip = [
-      'Alfombra — limpieza básica:',
-      '1) Aspira a fondo.',
-      '2) Prueba en zona oculta.',
-      '3) Limpiador de alfombras, cepilla y retira.',
-      '4) Seca con ventilación.'
+      'Baño con hongos — rápido:',
+      '1) Ventila y usa guantes.',
+      '2) Aplica antihongos 5–10 min.',
+      '3) Cepilla, enjuaga y seca bien.'
     ].join('\n');
-    const items = await searchMulti(['alfombra limpiador', 'tapicerias astonish', 'protector textil'], 3);
-    const list = buildProductsMarkdown(items);
-    return list ? `TIP: ${tip}\n\n${list}` : `TIP: ${tip}`;
-  }
-
-  if (/olla.*quemad/i.test(raw)) {
-    const tip = [
-      'Olla quemada — cómo salvarla:',
-      '1) Agua + bicarbonato (o vinagre) y hierve 5 min.',
-      '2) Enfría y desprende con espátula.',
-      '3) Pasta desengrasante y enjuaga.',
-      '4) En inox, limpiador específico.'
-    ].join('\n');
-    const items = await searchMulti(['pink stuff pasta 850', 'astonish vitroceramica kit', 'weiman acero inoxidable 710'], 3);
     const list = buildProductsMarkdown(items);
     return list ? `TIP: ${tip}\n\n${list}` : `TIP: ${tip}`;
   }
@@ -507,7 +617,7 @@ app.post('/chat', async (req, res) => {
     const userFirstName = (meta.userFirstName || '').trim();
     const FREE_TH = Number(FREE_SHIPPING_THRESHOLD_CLP ?? FREE_TH_DEFAULT);
 
-    // Respuesta post-tool (addToCartClient)
+    // Post-tool
     if (toolResult?.id) {
       const r = await openai.chat.completions.create({
         model: 'gpt-4o-mini',
@@ -521,7 +631,7 @@ app.post('/chat', async (req, res) => {
 
     const intent = detectIntent(message || '');
 
-    /* ===== Rama informativa / FAQs (incluye envíos) ===== */
+    /* ===== Rama informativa / FAQs ===== */
     if (intent === 'info') {
       const faq = await faqAnswerOrNull(message || '', meta);
       if (faq) {
@@ -549,7 +659,7 @@ app.post('/chat', async (req, res) => {
         return res.json({ text });
       }
 
-      // Consejos compactos por IA (sin links inventados)
+      // Consejos compactos por IA + productos relacionados (con prioridad por título y stock)
       const ai = await openai.chat.completions.create({
         model: 'gpt-4o-mini',
         messages: [
@@ -564,12 +674,35 @@ app.post('/chat', async (req, res) => {
           { role: 'user', content: message || '' }
         ]
       });
-      const text = maybePrependGreetingTip(ai.choices[0].message.content, meta, FREE_TH);
-      return res.json({ text });
+
+      let aiText = ai.choices[0].message.content || 'Te explico los pasos clave:';
+      const wanted = parseRequestedCount(message, 4);
+
+      // 1) Coincidencia por TÍTULO con palabras del cliente
+      let picks = await titleMatchProducts(message, wanted);
+
+      // 2) Completar con keywords si faltan
+      if (picks.length < Math.max(3, wanted)) {
+        const kws = extractKeywords(message, 6);
+        if (kws.length) {
+          const more = await searchMulti(kws, wanted - picks.length);
+          const seen = new Set(picks.map(p=>p.handle));
+          for (const m of more) if (!seen.has(m.handle)) picks.push(m);
+        }
+      }
+
+      // 3) Respuesta final
+      let textOut = aiText.trim();
+      if (picks.length) {
+        const list = buildProductsMarkdown(picks);
+        if (list) textOut += `\n\n${list}`;
+      }
+
+      return res.json({ text: maybePrependGreetingTip(textOut, meta, FREE_TH) });
     }
 
     /* ===== Ganchos previos (browse/buy) sin IA ===== */
-    const qn = fold(message || '');
+    const qn = norm(message || '');
     if (/(mas vendidos|más vendidos|best sellers|top ventas|lo mas vendido|lo más vendido)/.test(qn)) {
       const items = await listTopSellers(5);
       let text = buildProductsMarkdown(items) || "Por ahora no tengo un ranking de más vendidos.";
@@ -577,8 +710,8 @@ app.post('/chat', async (req, res) => {
       return res.json({ text });
     }
 
-    const mBrand = (message || '').toLowerCase().match(/tienen la marca\s+([a-z0-9&\-\s]+)/i)
-                || (message || '').toLowerCase().match(/tienen\s+([a-z0-9&\-\s]+)\??$/i);
+    const brandAsk = message || '';
+    const mBrand = brandAsk.toLowerCase().match(/tienen la marca\s+([a-z0-9&\-\s]+)/i) || brandAsk.toLowerCase().match(/tienen\s+([a-z0-9&\-\s]+)\??$/i);
     if (mBrand) {
       const brand = mBrand[1].trim();
       if (brand.length >= 2 && brand.length <= 40) {
@@ -623,7 +756,7 @@ app.post('/chat', async (req, res) => {
       }
     }
 
-    // 1 por zona (baño/cocina/horno)
+    // Peticiones por zona (baño/cocina/horno) → ahora devuelve MÁS de 1
     const wantsBano   = /ba[nñ]o/.test(qn);
     const wantsCocina = /cocina/.test(qn);
     const wantsHorno  = /horno/.test(qn);
@@ -632,10 +765,16 @@ app.post('/chat', async (req, res) => {
       if (wantsBano) zones.push('baño');
       if (wantsCocina) zones.push('cocina');
       if (wantsHorno) zones.push('horno');
-      const items = await recommendZoneProducts(zones);
+
+      const wantedPerZone = zones.length === 1 ? parseRequestedCount(message, 4) : 2;
+      const maxTotal = zones.length === 1 ? Math.max(4, wantedPerZone) : Math.max(4, zones.length * 2);
+
+      const items = await recommendZoneProducts(zones, wantedPerZone, maxTotal);
       if (items.length) {
-        const tip = 'TIP: Te dejo 1 sugerencia por zona. Si quieres alternativas (sin aroma, más eco, etc.) dime y ajusto.';
-        let text = `${tip}\n\n${buildProductsMarkdown(items)}`;
+        const header = zones.length === 1
+          ? `Te dejo opciones para **${zones[0]}**:`
+          : `Te dejo sugerencias por zona (${zones.join(', ')}):`;
+        let text = `${header}\n\n${buildProductsMarkdown(items)}`;
         text = maybePrependGreetingTip(text, meta, FREE_TH);
         return res.json({ text });
       }
@@ -703,7 +842,15 @@ app.post('/chat', async (req, res) => {
       }
     }
 
-    // Fallback: búsqueda directa
+    // Antes del fallback simple: prioriza coincidencia por TÍTULO + STOCK
+    const direct = await titleMatchProducts(message, 5);
+    if (direct.length) {
+      let text = buildProductsMarkdown(direct);
+      text = maybePrependGreetingTip(text, meta, FREE_TH);
+      return res.json({ text });
+    }
+
+    // Fallback: búsqueda directa simple
     try {
       const forced = await shopifyStorefrontGraphQL(`
         query ProductSearch($q: String!) {
@@ -721,10 +868,9 @@ app.post('/chat', async (req, res) => {
     } catch (err) { console.warn('Fallback searchProducts failed:', err?.message || err); }
 
     // Fallback final
-    const name = (meta?.userFirstName || '').trim();
     return res.json({
-      text: name
-        ? `Gracias, ${name}. ¿Me das una pista más (marca, superficie, aroma)? También puedo sugerir opciones similares.`
+      text: userFirstName
+        ? `Gracias, ${userFirstName}. ¿Me das una pista más (marca, superficie, aroma)? También puedo sugerir opciones similares.`
         : "No encontré resultados exactos. ¿Me das una pista más (marca, superficie, aroma)? También puedo sugerir opciones similares."
     });
 
