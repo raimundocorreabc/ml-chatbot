@@ -16,7 +16,10 @@ const {
   FREE_SHIPPING_THRESHOLD_CLP, // default 40000 (RM)
   MUNDOPUNTOS_EARN_PER_CLP,
   MUNDOPUNTOS_REDEEM_PER_100,
-  MUNDOPUNTOS_PAGE_URL
+  MUNDOPUNTOS_PAGE_URL,
+
+  // Carrusel de marcas (opcional): JSON de [{title,url,image}]
+  BRAND_CAROUSEL_JSON
 } = process.env;
 
 if (!OPENAI_API_KEY) throw new Error("Falta OPENAI_API_KEY");
@@ -28,7 +31,7 @@ const allowed = (ALLOWED_ORIGINS || '').split(',').map(s => s.trim()).filter(Boo
 const app = express();
 app.use(express.json());
 
-// CORS con logging de diagnóstico
+// CORS con pequeño log
 app.use(cors({
   origin: (origin, cb) => {
     const ok = (!origin || allowed.includes(origin));
@@ -50,11 +53,10 @@ function formatCLP(n) {
 }
 function titleCaseComuna(s) { return String(s||'').toLowerCase().replace(/\b\w/g, m => m.toUpperCase()); }
 
-// Normalización
 function norm(s=''){ return String(s).normalize('NFD').replace(/[\u0300-\u036f]/g,'').toLowerCase(); }
 function fold(s=''){ return norm(s).replace(/ñ/g,'n'); }
 
-/* ---------------- Regiones y comunas ---------------- */
+/* ---------------- Regiones y comunas (para intención "envío") ---------------- */
 const REGIONES = [
   'arica y parinacota','tarapaca','antofagasta','atacama','coquimbo','valparaiso',
   'metropolitana','santiago',"o'higgins",'ohiggins','maule','nuble','biobio',
@@ -68,6 +70,28 @@ const COMUNAS = [
   'conchalí','san miguel','san joaquín','la cisterna','san bernardo','colina','buin','lampa'
 ];
 const COMUNAS_FOLDED = new Set(COMUNAS.map(fold));
+
+/* ---------------- Tarifas de envío por zona (lo que nos diste) ---------------- */
+const SHIPPING_ZONES = [
+  { zone: 'REGIÓN METROPOLITANA', cost: 3990, regions: ['Metropolitana','Santiago'] },
+  { zone: 'ZONA CENTRAL',         cost: 6990, regions: ['Coquimbo','Valparaíso','Valparaiso',"O’Higgins","O'Higgins",'Maule','Ñuble','Nuble','Biobío','Biobio','Araucanía','Araucania','Los Ríos','Los Rios','Los Lagos'] },
+  { zone: 'ZONA NORTE',           cost: 10990, regions: ['Arica y Parinacota','Tarapacá','Tarapaca','Antofagasta','Atacama'] },
+  { zone: 'ZONA AUSTRAL',         cost: 14990, regions: ['Aysén','Aysen','Magallanes'] }
+];
+// Mapa rápido region→{zone,cost}
+const REGION_COST_MAP = (() => {
+  const m = new Map();
+  for (const z of SHIPPING_ZONES) {
+    for (const r of z.regions) m.set(fold(r), { zone: z.zone, cost: z.cost });
+  }
+  // RM aliases
+  m.set('metropolitana', { zone: 'REGIÓN METROPOLITANA', cost: 3990 });
+  m.set('santiago',      { zone: 'REGIÓN METROPOLITANA', cost: 3990 });
+  return m;
+})();
+function shippingByRegionName(input='') {
+  return REGION_COST_MAP.get(fold(input)) || null;
+}
 
 /* ---------------- Shopify utils ---------------- */
 async function shopifyStorefrontGraphQL(query, variables = {}) {
@@ -227,71 +251,13 @@ function maybePrependGreetingTip(text, meta, FREE_TH) {
   return `TIP: Hola, ${name} 👋${extra}\n\n${text}`;
 }
 
-/* ==================== Helpers de TIPs temáticos ==================== */
-
-// LISTAR MARCAS (vendors)
-async function listVendors(limit = 20) {
-  const data = await shopifyStorefrontGraphQL(`
-    query Vendors {
-      products(first: 100) {
-        edges { node { vendor } }
-      }
-    }
-  `);
-  const vendors = (data.products?.edges || [])
-    .map(e => (e.node.vendor || '').trim())
-    .filter(Boolean);
-
-  const freq = new Map();
-  for (const v of vendors) freq.set(v, (freq.get(v) || 0) + 1);
-  const sorted = [...freq.entries()].sort((a,b) => b[1]-a[1]).map(([v]) => v);
-
-  return sorted.slice(0, limit);
-}
-
-// LISTAR COLECCIONES (filtradas)
-async function listCollections(limit = 10) {
-  const data = await shopifyStorefrontGraphQL(`
-    query Colls($n:Int!) {
-      collections(first: $n) { edges { node { title handle } } }
-    }
-  `, { n: limit + 5 });
-  const all = (data.collections?.edges || []).map(e => ({
-    title: e.node.title, handle: e.node.handle
-  }));
-  // filtra algunas no útiles
-  const skip = new Set(['frontpage','all','sale','ofertas','destacados']);
-  return all.filter(c => !skip.has(String(c.handle).toLowerCase())).slice(0, limit);
-}
-
-// RECOMENDAR 1 PRODUCTO POR ZONA
-async function recommendZoneProducts(zones = []) {
-  const queries = {
-    'baño':   ['astonish baño 750', 'baño limpiador astonish', 'baño desinfección'],
-    'cocina': ['degreaser cocina', 'astonish kitchen', 'cif crema'],
-    'horno':  ['astonish horno parrilla', 'goo gone bbq horno'],
-  };
-
-  const picks = [];
-  for (const z of zones) {
-    const qs = queries[z] || [];
-    let found = null;
-    for (const q of qs) {
-      const items = await searchProductsPlain(q, 1);
-      if (items.length) { found = items[0]; break; }
-    }
-    if (found) picks.push(found);
-  }
-  return picks;
-}
-
-// TIPS concisos + productos
+/* ==================== TIPS concisos + productos ==================== */
 async function tipVitro() {
   const tip = [
     'Vitrocerámica — pasos rápidos:',
     '1) Con la placa fría, retira residuos con rasqueta plástica.',
     '2) Aplica crema específica, deja actuar 1–2 min.',
-    '3) Pasa paño microfibra; repite en manchas quemadas.',
+    '3) Pasa microfibra; repite en manchas quemadas.',
     '4) Termina con protector/abrillantador si quieres más brillo.'
   ].join('\n');
   const items = await searchMulti(['weiman vitroceramica crema', 'weiman cook top kit', 'astonish vitroceramica'], 3);
@@ -317,7 +283,7 @@ async function tipCortina() {
     'Cortina tela — cuidado rápido:',
     '1) Aspira el polvo con boquilla suave.',
     '2) Trata manchas puntuales con quitamanchas de telas.',
-    '3) Lava según etiqueta (ciclo delicado) o limpieza en seco.',
+    '3) Lava según etiqueta o limpieza en seco.',
     '4) Protege con spray textil anti manchas si es habitual.'
   ].join('\n');
   const items = await searchMulti(['quitamanchas tela', 'protector textil', 'limpiador telas'], 3);
@@ -372,51 +338,71 @@ function detectIntent(text = '') {
   return 'browse';
 }
 
+/* ---------------- Carrusel de marcas ---------------- */
+function parseBrandCarouselConfig() {
+  try { return JSON.parse(BRAND_CAROUSEL_JSON || '[]'); } catch { return []; }
+}
+function buildBrandsPayload(brands = []) {
+  if (!brands.length) return null;
+  // Formato: BRANDS:\nTitle|URL|Image(optional)
+  const rows = brands.map(b => {
+    const title = (b.title || '').trim();
+    const url   = (b.url   || '').trim();
+    const image = (b.image || '').trim();
+    if (!title || !url) return null;
+    return [title, url, image].join('|');
+  }).filter(Boolean);
+  return rows.length ? `BRANDS:\n${rows.join('\n')}` : null;
+}
+
 /* ==================== FAQ/guías (async) ==================== */
 async function faqAnswerOrNull(message = '', meta = {}) {
   const raw = (message || '').trim();
   const q = norm(raw);
 
   const FREE_TH = Number(FREE_SHIPPING_THRESHOLD_CLP ?? FREE_TH_DEFAULT);
-  const freeStrRM = FREE_TH > 0 ? `**envío gratis** desde **${formatCLP(FREE_TH)}**` : null;
   const destinosUrl = `${BASE}/pages/destinos-disponibles-en-chile`;
 
-  // Región sola
+  // Región sola → costo referencial + recordatorio RM
   if (REGIONES_FOLDED.has(q)) {
+    const regNice = REGIONES.find(r => fold(r) === q) || raw;
+    const ship = shippingByRegionName(regNice);
     const isRM = /metropolitana|santiago/.test(q);
-    const rmExtra = isRM && freeStrRM ? ` En RM, ${freeStrRM}.` : '';
-    let line = `Hacemos despacho a **todo Chile**.${rmExtra} Para regiones, el costo se calcula en el checkout según **región y comuna** y peso. Frecuencias por zona: ${destinosUrl}`;
-    const sub = Number(meta?.cartSubtotalCLP || 0);
-    if (isRM && sub > 0 && FREE_TH > 0 && sub < FREE_TH) {
-      line = `TIP: Te faltan **${formatCLP(FREE_TH - sub)}** para envío gratis en RM.\n\n${line}`;
+    let parts = [];
+    if (ship) {
+      parts.push(`Para **${titleCaseComuna(regNice)}** (${ship.zone}), el costo referencial es **${formatCLP(ship.cost)}**.`);
+    } else {
+      parts.push(`Para **${titleCaseComuna(regNice)}**, el costo se calcula en el checkout según **región/comuna** y peso.`);
     }
-    return line;
+    if (isRM && FREE_TH > 0) {
+      parts.push(`En **RM** ofrecemos **envío gratis** sobre **${formatCLP(FREE_TH)}** (bajo ese monto: ${formatCLP(3990)}).`);
+    }
+    parts.push(`📦 Frecuencias por zona: ${destinosUrl}`);
+    return parts.join(' ');
   }
 
-  // Comuna sola
+  // Comuna sola → mantener genérico + link
   if (COMUNAS_FOLDED.has(q)) {
     const idx = COMUNAS.findIndex(c => fold(c) === q);
     const comunaNice = idx >= 0 ? titleCaseComuna(COMUNAS[idx]) : titleCaseComuna(raw);
-    const rmHint = freeStrRM ? ` En RM, ${freeStrRM}.` : '';
-    let line = `Hacemos despacho a **todo Chile**.${rmHint} Para **${comunaNice}**, el costo se calcula en el checkout al ingresar **región y comuna**. Frecuencias por zona: ${destinosUrl}`;
-    const sub = Number(meta?.cartSubtotalCLP || 0);
-    if (sub > 0 && FREE_TH > 0 && sub < FREE_TH) {
-      line = `TIP: Te faltan **${formatCLP(FREE_TH - sub)}** para envío gratis en RM.\n\n${line}`;
-    }
-    return line;
+    return `Hacemos despacho a **todo Chile**. Para **${comunaNice}**, el costo se calcula automáticamente en el checkout al ingresar **región y comuna**. Si me confirmas la **región**, puedo darte el costo referencial. 📦 Frecuencias: ${destinosUrl}`;
   }
 
-  // ENVÍOS genérico
+  // ENVÍOS genérico (incluye "¿sobre cuánto tengo envío gratis?")
   if (/(env[ií]o|envio|despacho|retiro)/i.test(raw)) {
-    const base = `Hacemos despacho a **todo Chile**.`;
-    const sub = Number(meta?.cartSubtotalCLP || 0);
-    const progress = (sub > 0 && FREE_TH > 0 && sub < FREE_TH)
-      ? `TIP: Te faltan **${formatCLP(FREE_TH - sub)}** para envío gratis en RM.\n\n` : '';
-    if (/gratis|m[ií]nimo|minimo|sobre cu[aá]nto/i.test(raw)) {
-      if (freeStrRM) return `${progress}${base} En **RM** ofrecemos ${freeStrRM}. Bajo ese monto, y para **regiones**, el costo se calcula en checkout según **región/comuna** y peso. ¿Para qué **región y comuna** lo necesitas? Frecuencias: ${destinosUrl}`;
-      return `${progress}${base} El costo se calcula en checkout según **región/comuna** y peso. ¿Para qué **región y comuna** lo necesitas? Frecuencias: ${destinosUrl}`;
-    }
-    return `${progress}${base} El costo y tiempos dependen de **región/comuna** y peso. En el checkout verás las opciones disponibles. ¿Para qué **región y comuna**? Frecuencias: ${destinosUrl}`;
+    const header = FREE_TH > 0
+      ? `En la **Región Metropolitana (RM)** ofrecemos **envío gratis** en compras sobre **${formatCLP(FREE_TH)}**.`
+      : `Hacemos despacho a **todo Chile**.`;
+    const para2 = `Para pedidos bajo ese monto en la RM, y para **todas las regiones**, el costo de envío se calcula automáticamente en el **checkout** según la **región y comuna** de destino.`;
+    const para3 = `Si me indicas tu **región** y **comuna**, puedo confirmarte el **costo** y la **frecuencia de entrega** en tu zona.`;
+    const para4 = `📦 Frecuencias de entrega: ${destinosUrl}`;
+    const tarifas =
+      `Tarifas referenciales por región:\n` +
+      `- **RM**: ${formatCLP(3990)}\n` +
+      `- **Zona Central**: ${formatCLP(6990)}\n` +
+      `- **Zona Norte**: ${formatCLP(10990)}\n` +
+      `- **Zona Austral**: ${formatCLP(14990)}`;
+    return [header, '', para2, '', para3, para4, '', tarifas].join('\n');
   }
 
   // ¿Dónde canjear cupón en checkout?
@@ -428,20 +414,32 @@ async function faqAnswerOrNull(message = '', meta = {}) {
     ].join(' ');
   }
 
-  // ¿Qué es Mundo Limpio? / ¿Qué venden?
+  // ¿Qué es Mundo Limpio? / ¿Qué venden? → categorías como botones
   if (/(que es|qué es|quienes son|quiénes son).*(mundolimpio|mundo limpio)|que venden en mundolimpio|que productos venden\??$/i.test(raw)) {
     const cols = await listCollections(8);
     if (!cols.length) return `**MundoLimpio.cl** es una tienda chilena de limpieza/hogar premium.`;
-    // devolvemos para el front como botones
     const payload = cols.map(c => `${c.title}|${BASE}/collections/${c.handle}`).join('\n');
     return `CATS:\n${payload}`;
   }
 
-  // ¿Qué MARCAS venden?
+  // ¿Qué MARCAS venden? → carrusel
   if (/(que|qué)\s+marcas.*venden|marcas\s*(disponibles|que tienen|venden)/i.test(raw)) {
+    // 1) si hay config manual, úsala
+    const custom = parseBrandCarouselConfig();
+    if (custom.length) {
+      const payload = buildBrandsPayload(custom);
+      if (payload) return payload;
+    }
+    // 2) fallback: vendors más frecuentes (sin logo)
     const vendors = await listVendors(20);
     if (!vendors.length) return 'Trabajamos varias marcas internacionales y locales. ¿Cuál te interesa?';
-    return `Trabajamos marcas como: **${vendors.join('**, **')}**. ¿Buscas alguna en particular?`;
+    const brands = vendors.map(v => ({
+      title: v,
+      url: `${BASE}/collections/vendors?q=${encodeURIComponent(v)}`,
+      image: '' // sin logo por defecto
+    }));
+    const payload = buildBrandsPayload(brands);
+    return payload || `Trabajamos marcas como: **${vendors.join('**, **')}**. ¿Buscas alguna en particular?`;
   }
 
   // ¿Qué TIPOS de productos venden? → categorías como botones
@@ -459,7 +457,7 @@ async function faqAnswerOrNull(message = '', meta = {}) {
   if (/olla.*quemad/i.test(q)) return await tipOllaQuemada();
   if (/sill[oó]n|sofa|sof[aá]|tapiz/i.test(q)) return await tipSillon();
 
-  // MUNDOPUNTOS (sin link si no hay página)
+  // MUNDOPUNTOS
   if (/mundopuntos|puntos|fidelizaci[óo]n/i.test(raw)) {
     const earn = Number(MUNDOPUNTOS_EARN_PER_CLP || 1);
     const redeem100 = Number(MUNDOPUNTOS_REDEEM_PER_100 || 3);
@@ -499,7 +497,6 @@ function synonymQueryOrNull(message='') {
   if (/ecolog|eco|biodegrad/i.test(q)) return 'ecologico biodegradable eco plant-based';
   return null;
 }
-
 function extractBrandOrNull(message='') {
   const q = message.toLowerCase();
   const m = q.match(/tienen la marca\s+([a-z0-9&\-\s]+)/i) || q.match(/tienen\s+([a-z0-9&\-\s]+)\??$/i);
@@ -508,7 +505,6 @@ function extractBrandOrNull(message='') {
   if (brand.length < 2 || brand.length > 40) return null;
   return brand;
 }
-
 function isAskBestSellers(message='') {
   const q = norm(message);
   return /(mas vendidos|más vendidos|best sellers|top ventas|lo mas vendido|lo más vendido)/.test(q);
@@ -535,16 +531,15 @@ app.post('/chat', async (req, res) => {
 
     const intent = detectIntent(message || '');
 
-    /* ===== Rama informativa / FAQs sin tarjetas ===== */
+    /* ===== Rama informativa / FAQs ===== */
     if (intent === 'info') {
-      // 1) Intentar FAQ directa (incluye TIPS + productos cuando aplica)
       const faq = await faqAnswerOrNull(message || '', meta);
       if (faq) {
         const withTip = maybePrependGreetingTip(faq, meta, FREE_TH);
         return res.json({ text: withTip });
       }
 
-      // 2) Si no es FAQ, intentar extraer info de un producto relacionado
+      // Producto relacionado (resumen corto)
       const forced = await shopifyStorefrontGraphQL(`
         query ProductSearch($q: String!) {
           search(query: $q, types: PRODUCT, first: 1) {
@@ -568,7 +563,7 @@ app.post('/chat', async (req, res) => {
         return res.json({ text });
       }
 
-      // 3) Fallback de conocimiento (consejos cortos, sin links inventados)
+      // Consejos compactos por IA (sin links inventados)
       const ai = await openai.chat.completions.create({
         model: 'gpt-4o-mini',
         messages: [
@@ -587,7 +582,7 @@ app.post('/chat', async (req, res) => {
       return res.json({ text });
     }
 
-    /* ===== Ganchos previos (browse/buy) sin IA) ===== */
+    /* ===== Ganchos previos (browse/buy) sin IA ===== */
     if (isAskBestSellers(message || '')) {
       const items = await listTopSellers(5);
       let text = buildProductsMarkdown(items) || "Por ahora no tengo un ranking de más vendidos.";
@@ -750,4 +745,3 @@ app.get('/health', (_, res) => res.json({ ok: true }));
 
 const port = PORT || process.env.PORT || 3000;
 app.listen(port, () => console.log('ML Chat server on :' + port));
-
