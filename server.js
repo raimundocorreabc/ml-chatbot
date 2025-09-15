@@ -1,4 +1,4 @@
-// server.js — IA-first + patches: regiones canónicas, fallback IA->tops, aerosol, tops robusto
+// server.js — IA-first + categorías/brands/envíos/regiones/shopping-list sólidos
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
@@ -128,40 +128,30 @@ async function preferInStock(items, need){
 }
 
 /* ----- Shipping regiones/comunas + zonas ----- */
-// Lista canónica (sin duplicados visuales)
-const REGIONES_CANON = [
+const REGIONES_LIST = [
   'Arica y Parinacota','Tarapacá','Antofagasta','Atacama',
-  'Coquimbo','Valparaíso',"O'Higgins",'Maule','Ñuble','Biobío','Araucanía','Los Ríos','Los Lagos',
+  'Coquimbo','Valparaíso',"O’Higgins","O'Higgins",'Maule','Ñuble','Biobío','Araucanía','Los Ríos','Los Lagos',
   'Metropolitana','Santiago',
   'Aysén','Magallanes'
 ];
-// Construimos universo para detección (canónicas + variantes que ya traen las zonas)
+const REGIONES_F = new Set(REGIONES_LIST.map(fold));
+const COMUNAS = ['Las Condes','Vitacura','Lo Barnechea','Providencia','Ñuñoa','La Reina','Santiago','Macul','La Florida','Puente Alto','Maipú','Maipu','Huechuraba','Independencia','Recoleta','Quilicura','Conchalí','Conchali','San Miguel','San Joaquín','San Joaquin','La Cisterna','San Bernardo','Colina','Buin','Lampa'];
+const COMUNAS_F = new Set(COMUNAS.map(fold));
+
 const SHIPPING_ZONES = [
   { zone:'REGIÓN METROPOLITANA', cost:3990,  regions:['Metropolitana','Santiago'] },
   { zone:'ZONA CENTRAL',         cost:6990,  regions:['Coquimbo','Valparaíso','Valparaiso',"O’Higgins","O'Higgins",'Maule','Ñuble','Nuble','Biobío','Biobio','Araucanía','Araucania','Los Ríos','Los Rios','Los Lagos'] },
   { zone:'ZONA NORTE',           cost:10990, regions:['Arica y Parinacota','Tarapacá','Tarapaca','Antofagasta','Atacama'] },
   { zone:'ZONA AUSTRAL',         cost:14990, regions:['Aysén','Aysen','Magallanes'] }
 ];
-const REGIONES_ALL = Array.from(new Set([...REGIONES_CANON, ...SHIPPING_ZONES.flatMap(z=>z.regions)]));
-const REGIONES_F = new Set(REGIONES_ALL.map(fold));
-
-const COMUNAS = ['Las Condes','Vitacura','Lo Barnechea','Providencia','Ñuñoa','La Reina','Santiago','Macul','La Florida','Puente Alto','Maipú','Maipu','Huechuraba','Independencia','Recoleta','Quilicura','Conchalí','Conchali','San Miguel','San Joaquín','San Joaquin','La Cisterna','San Bernardo','Colina','Buin','Lampa'];
-const COMUNAS_F = new Set(COMUNAS.map(fold));
-
 const REGION_COST_MAP = (()=>{ const m=new Map(); for(const z of SHIPPING_ZONES) for(const r of z.regions) m.set(fold(r),{zone:z.zone,cost:z.cost}); m.set('metropolitana',{zone:'REGIÓN METROPOLITANA',cost:3990}); m.set('santiago',{zone:'REGIÓN METROPOLITANA',cost:3990}); return m; })();
 const shippingByRegionName = (s='') => REGION_COST_MAP.get(fold(s)) || null;
 
-// Chips de regiones (sin duplicados, orden norte→sur)
 function regionsPayloadLines(){
-  const seen = new Set();
-  const rows = [];
-  for (const r of REGIONES_CANON){
-    const k = fold(r);
-    if (seen.has(k)) continue;
-    seen.add(k);
-    rows.push(`${r}|${r}`);
-  }
-  return rows.join('\n');
+  // Chips de regiones (para que el front lo muestre como carrusel y haga “envío <región>” al click)
+  const uniq = Array.from(new Set(REGIONES_LIST.map(r=>r.replace(/\"/g,''))));
+  // Formato: "Titulo|ValorAlClick"
+  return uniq.map(r => `${r}|${r}`).join('\n');
 }
 
 /* ----- Shopping list (1 por ítem, mismo orden) ----- */
@@ -180,6 +170,7 @@ const SHOPPING_SYNONYMS = {
 const tokenize = s => norm(s).replace(/[^a-z0-9\s]/g,' ').split(/\s+/).filter(Boolean);
 
 function splitShopping(text=''){
+  // Acepta: "necesito: lavalozas, esponja, limpiador de parrilla y limpiador de alfombra"
   const afterColon = text.split(':');
   const base = afterColon.length > 1 ? afterColon.slice(1).join(':') : text;
   return base.split(/,|\by\b/gi).map(s=>s.trim()).filter(Boolean);
@@ -187,6 +178,7 @@ function splitShopping(text=''){
 
 async function bestMatchForPhrase(phrase){
   const p = phrase.toLowerCase().trim();
+  // mapear a sinónimos si exacto
   const syn = SHOPPING_SYNONYMS[p] || [p];
   const pool=[]; const seen=new Set();
   for (const q of syn){
@@ -194,6 +186,7 @@ async function bestMatchForPhrase(phrase){
     for (const it of found){ if(!seen.has(it.handle)){ seen.add(it.handle); pool.push(it);} }
   }
   if (!pool.length) {
+    // fallback: usa tokens relevantes del texto
     const tokens = tokenize(phrase).filter(t=>t.length>=3).slice(0,3);
     for(const t of tokens){
       const found = await searchProductsPlain(t, 6).catch(()=>[]);
@@ -206,7 +199,7 @@ async function bestMatchForPhrase(phrase){
 
 async function selectProductsByOrderedKeywords(message){
   const parts = splitShopping(message);
-  if (parts.length < 2) return null;
+  if (parts.length < 2) return null; // solo disparar este flujo cuando pidió varios
   const picks=[]; const used=new Set();
   for (const seg of parts){
     const m = await bestMatchForPhrase(seg);
@@ -257,15 +250,25 @@ No inventes enlaces ni stock. No repitas consejos obvios.
 
 const PURPOSE_REGEX = /\b(para que sirve|para qué sirve|que es|qué es|como usar|cómo usar|modo de uso|instrucciones|paso a paso|como limpiar|cómo limpiar|consejos|tips|guia|guía|pasos)\b/i;
 
+/* === CAMBIO APLICADO: priorizar "envío <región/comuna>" === */
 function detectIntent(text=''){
   const q = norm(text);
+
+  // Si viene "envío <lugar>", intenta rutear directo a shipping_region
+  const m = String(text||'').match(/^env[ií]o\s+(.+)$/i);
+  if (m) {
+    const loc = fold(m[1]);
+    if (REGIONES_F.has(loc) || COMUNAS_F.has(loc)) return 'shipping_region';
+  }
+
+  if (REGIONES_F.has(fold(text)) || COMUNAS_F.has(fold(text))) return 'shipping_region';
   if (/(mas vendidos|más vendidos|best sellers|top ventas|lo mas vendido|lo más vendido)/.test(q)) return 'tops';
   if (/(envio|env[ií]o|despacho|retiro)/.test(q)) return 'shipping';
   if (/(mundopuntos|puntos|fidelizaci[óo]n)/.test(q)) return 'points';
   if (/(que marcas|qué marcas|marcas venden|marcas disponibles)/.test(q)) return 'brands';
   if (/(categorias|categorías|tipos de productos|colecciones|que productos venden|qué productos venden)/.test(q)) return 'categories';
-  if (REGIONES_F.has(fold(text)) || COMUNAS_F.has(fold(text))) return 'shipping_region';
   if (PURPOSE_REGEX.test(text)) return 'info';
+  // shopping-list si trae comas o "necesito:"
   if (/,/.test(text) || /necesito:|lista:|comprar:|quiero:/.test(q)) return 'shopping';
   return 'browse';
 }
@@ -315,6 +318,7 @@ app.post('/chat', async (req,res)=>{
         const payload = cols.map(c=>`${c.title}|${BASE}/collections/${c.handle}`).join('\n');
         return res.json({ text: `CATS:\n${payload}` });
       }
+      // fallback: chips hacia búsqueda por palabras (sin inventar handles)
       const fallback = [
         ['LIMPIEZA Y ASEO', `${BASE}/search?q=limpieza`],
         ['LAVADO DE ROPA',  `${BASE}/search?q=ropa`],
@@ -344,12 +348,13 @@ app.post('/chat', async (req,res)=>{
     /* ---- Envíos (cuando escribe la región/comuna) ---- */
     if (intent === 'shipping_region'){
       const q = String(message||'').trim();
-      if (REGIONES_F.has(fold(q))){
-        const ship = shippingByRegionName(q);
-        const isRM = /metropolitana|santiago/.test(fold(q));
+      if (REGIONES_F.has(fold(q)) || /^env[ií]o\s+/i.test(q)) {
+        const reg = q.replace(/^env[ií]o\s+/i,'').trim();
+        const ship = shippingByRegionName(reg);
+        const isRM = /metropolitana|santiago/.test(fold(reg));
         const pieces = [];
-        if (ship) pieces.push(`Para **${q}** (${ship.zone}) el costo referencial es **${fmtCLP(ship.cost)}**.`);
-        else pieces.push(`Para **${q}** el costo se calcula en el checkout por región/comuna.`);
+        if (ship) pieces.push(`Para **${reg}** (${ship.zone}) el costo referencial es **${fmtCLP(ship.cost)}**.`);
+        else pieces.push(`Para **${reg}** el costo se calcula en el checkout por región/comuna.`);
         if (isRM && FREE_TH>0) pieces.push(`En **RM** hay **envío gratis** sobre **${fmtCLP(FREE_TH)}**.`);
         return res.json({ text: pieces.join(' ') });
       }
@@ -377,8 +382,8 @@ app.post('/chat', async (req,res)=>{
 
     /* ---- IA para info (paso a paso) + sugerencias concretas ---- */
     if (intent === 'info' || intent === 'browse'){
-      // 1) Mini plan con IA
-      let aiText = '';
+      // 1) Mini plan con IA (bloque TIP:)
+      let tipText = '';
       try{
         const ai = await openai.chat.completions.create({
           model: 'gpt-4o-mini',
@@ -387,24 +392,18 @@ app.post('/chat', async (req,res)=>{
             { role: 'user', content: message || '' }
           ]
         });
-        aiText = (ai.choices?.[0]?.message?.content || '').trim();
+        const out = (ai.choices?.[0]?.message?.content || '').trim();
+        if (out) tipText = `TIP: ${out}`;
       }catch(err){
         console.warn('[ai] fallo mini plan', err?.message||err);
       }
-      const tipText = aiText ? `TIP: ${aiText}` : '';
 
-      // 2) Recomendaciones (heurísticas + título + fallbacks)
+      // 2) Recomendaciones de productos (precisas)
       let items = [];
 
+      // mapeos útiles (mejor precisión)
       const qn = norm(message||'');
-
-      // Heurística puntual: desodorante aerosol
-      if (/(desodorante|antitranspirante).*(aerosol|spray)|\baerosol\b.*(desodorante|antitranspirante)/i.test(message||'')) {
-        const pool = [];
-        pool.push(...await searchProductsPlain('desodorante aerosol', 12));
-        if (pool.length < 3) pool.push(...await searchProductsPlain('antitranspirante aerosol', 12));
-        items = await preferInStock(pool, 3);
-      } else if (/(impermeabiliz|protector).*(sillon|sof[aá]|tapiz)/.test(qn)) {
+      if (/(impermeabiliz|protector).*(sillon|sof[aá]|tapiz)/.test(qn)) {
         items = await searchProductsPlain('protector textil', 12).then(xs=>preferInStock(xs,3));
       } else if (/(olla).*(quemad)/.test(qn)) {
         const pool = [];
@@ -423,17 +422,8 @@ app.post('/chat', async (req,res)=>{
         }
         items = await preferInStock(pool,6);
       } else {
+        // scoring por título + stock
         items = await titleMatchProducts(message||'', 6);
-      }
-
-      // Si la IA “ofreció sugerir” pero no hay ítems, intenta con el propio texto de la IA
-      if ((!items || !items.length) && /¿?\s*te\s+(sugiero|dejo)/i.test(aiText||'')){
-        const extra = await titleMatchProducts(aiText, 3);
-        if (extra.length) items = extra;
-      }
-      // Último recurso: más vendidos
-      if (!items || !items.length){
-        items = await listTopSellers(6).then(xs=>preferInStock(xs,3));
       }
 
       const list = items.length ? `\n\n${buildProductsMarkdown(items)}` : '';
@@ -441,6 +431,7 @@ app.post('/chat', async (req,res)=>{
         ? `TIP: Hola, ${meta.userFirstName} 👋 | Te faltan ${fmtCLP(Number(FREE_TH||FREE_TH_DEFAULT) - Number(meta?.cartSubtotalCLP||0))} para envío gratis en RM\n\n`
         : '';
 
+      // si no hay IA, al menos devolvemos productos
       const finalText = (tipText ? `${greet}${tipText}${list}` : (list || 'No encontré coincidencias exactas. ¿Me das una pista más (marca, superficie, aroma)?'));
       return res.json({ text: finalText });
     }
@@ -458,4 +449,3 @@ app.post('/chat', async (req,res)=>{
 app.get('/health', (_,res)=>res.json({ ok:true }));
 const port = PORT || process.env.PORT || 3000;
 app.listen(port, ()=>console.log('ML Chat server on :'+port));
-
