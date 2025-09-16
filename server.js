@@ -1,4 +1,4 @@
-// server.js — IA-first + catálogo/brands/envíos/regiones/shopping-list + IA→keywords→Shopify
+// server.js — IA-first + catálogo/brands/envíos/regiones/shopping-list + Reglas de contexto + Fallbacks controlados
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
@@ -127,6 +127,39 @@ async function preferInStock(items, need){
   return out;
 }
 
+/* ====== Scoring y filtros de relevancia ====== */
+const STOP_HIT = new Set(['para','por','con','una','unos','unas','los','las','del','de','en','el','la','y','o','un','al','lo','su','mi','tu','sus','mis','tus']);
+function tokensFromPhrases(phrases=[]) {
+  const bag = [];
+  const push = t => { if (t && t.length>=4 && !STOP_HIT.has(t)) bag.push(t); };
+  for (const ph of phrases){
+    const toks = norm(ph).replace(/[^a-z0-9\s]/g,' ').split(/\s+/).filter(Boolean);
+    toks.forEach(push);
+    // además, raíces simples para captar derivados
+    toks.forEach(t => push(t.slice(0,6)));
+  }
+  return Array.from(new Set(bag));
+}
+
+async function pickTopWithRelevance(pool=[], hintPhrases=[], max=6){
+  if (!pool.length) return [];
+  const tokens = tokensFromPhrases(hintPhrases);
+  const scoreItem = (p) => {
+    const t = norm(`${p.title} ${p.handle}`);
+    const hits = tokens.reduce((n,kw)=> n + (kw && t.includes(kw) ? 1 : 0), 0);
+    return { ...p, _hits: hits };
+  };
+  const scored = pool.map(scoreItem);
+  let filtered = scored.filter(x => x._hits > 0);
+  if (!filtered.length) filtered = scored; // si nada supera el umbral, no filtramos para no quedar en blanco
+  filtered.sort((a,b)=> b._hits - a._hits);
+  // prioriza stock manteniendo el orden por hits
+  const inS = filtered.filter(x=>x.availableForSale);
+  const outS= filtered.filter(x=>!x.availableForSale);
+  const merged = [...inS, ...outS];
+  return merged.slice(0, max);
+}
+
 /* ----- Shipping regiones/comunas + zonas ----- */
 const REGIONES_LIST = [
   'Arica y Parinacota','Tarapacá','Antofagasta','Atacama',
@@ -160,7 +193,7 @@ const SHOPPING_SYNONYMS = {
   'esponja':   ['esponja','fibra','sponge','scrub daddy'],
   'parrillas': ['limpiador parrilla','bbq','grill','goo gone bbq','desengrasante parrilla'],
   'piso':      ['limpiador pisos','floor cleaner','bona','lithofin'],
-  'alfombra':  ['limpiador alfombra','tapiceria','tapiz','dr beckmann'], 
+  'alfombra':  ['limpiador alfombra','tapiceria','tapiz','dr beckmann'],
   'vidrio':    ['limpia vidrios','glass cleaner','weiman glass'],
   'acero':     ['limpiador acero inoxidable','weiman acero'],
   'protector textil': ['protector textil','impermeabilizante telas','fabric protector']
@@ -203,10 +236,10 @@ async function selectProductsByOrderedKeywords(message){
   return picks.length ? picks : null;
 }
 
-/* ----- Búsqueda precisa por título (fallback) ----- */
+/* ----- Búsqueda por título (frase + keywords) ----- */
 function extractKeywords(text='', max=8){
   const tokens = tokenize(text).filter(t => t.length>=3);
-  const stop = new Set(['tienen','venden','quiero','necesito','precio','productos','producto','limpieza','limpiar','ayuda','me','puedes','recomendar']);
+  const stop = new Set(['tienen','venden','quiero','necesito','precio','productos','producto','limpieza','limpiar','ayuda','me','puedes','recomendar','seccion','sección','utensilios','organizacion','organización']);
   const bag=[]; const seen=new Set();
   for (const t of tokens){
     if (stop.has(t)) continue;
@@ -217,21 +250,22 @@ function extractKeywords(text='', max=8){
   }
   return bag;
 }
+
 async function titleMatchProducts(queryText, max=6){
-  const pool = await searchProductsPlain(String(queryText||'').slice(0,120), 24);
-  if (!pool.length) return [];
+  let pool = await searchProductsPlain(String(queryText||'').slice(0,120), 24);
   const kws = extractKeywords(queryText, 10);
-  if (!kws.length) return (await preferInStock(pool, max)).slice(0,max);
-  const fld = s => norm(s);
-  const scored = pool.map(p => {
-    const t = fld(p.title);
-    const hits = kws.reduce((n,kw)=> n + (t.includes(kw) ? 1 : 0), 0);
-    return { ...p, _hits: hits };
-  });
-  const byHits = scored.sort((a,b)=> b._hits - a._hits).filter(x=>x._hits>0);
-  const shortlist = byHits.length ? byHits.slice(0, max*2) : pool.slice(0, max*2);
-  const ordered = await preferInStock(shortlist, max);
-  return ordered;
+  if (pool.length < max && kws.length) {
+    const seen = new Set(pool.map(p=>p.handle));
+    for (const kw of kws) {
+      const found = await searchProductsPlain(kw, 8).catch(()=>[]);
+      for (const it of found) {
+        if (!seen.has(it.handle)) { seen.add(it.handle); pool.push(it); }
+      }
+      if (pool.length >= max*2) break;
+    }
+  }
+  pool = await pickTopWithRelevance(pool, [queryText, ...kws], max*2);
+  return await preferInStock(pool, max);
 }
 
 /* ----- IA (TIP sin CTA) ----- */
@@ -242,7 +276,7 @@ NO incluyas CTAs como "¿Te sugiero...?" ni enlaces, marcas o /products/ dentro 
 Tono cercano y breve. No inventes stock, marcas ni precios.
 `;
 
-/* ----- IA → intención de productos (keywords/marcas) ----- */
+/* ----- IA → intención de productos (keywords/marcas) [fallback final] ----- */
 const AI_PRODUCT_QUERY = `
 Eres un extractor de intención para una tienda de limpieza en Chile.
 Dada la consulta del cliente, responde SOLO con un JSON así:
@@ -278,10 +312,9 @@ async function aiProductQuery(userText){
   }
 }
 
-// Ejecuta varias consultas a Shopify combinando keywords y (si hay) marca
+// Buscador con IA (último recurso) + re-rankeado por relevancia
 async function searchByQueries(keywords=[], brands=[], max=6){
   const pool=[]; const seen=new Set();
-
   const queries = [];
   for (const k of keywords){
     queries.push(k);
@@ -306,7 +339,61 @@ async function searchByQueries(keywords=[], brands=[], max=6){
     }
     if (pool.length >= max*3) break;
   }
-  return await preferInStock(pool, max);
+  const ranked = await pickTopWithRelevance(pool, queries, max*2);
+  return await preferInStock(ranked, max);
+}
+
+/* ====== Reglas por contexto (más específicas) ====== */
+const CONTEXT_RULES = [
+  // moho / hongos
+  { test: /(moho|hongo)s?/i, queries: ['antihongos', 'limpiador antihongos', 'spray antihongos baño', 'limpieza juntas baño'] },
+  // sarro / cal
+  { test: /(sarro|cal[ck]|calcifi)/i, queries: ['desincrustante', 'quita sarro', 'desincrustante baño', 'limpia sarro ducha'] },
+  // olla/sartén quemada o grasa pegada
+  { test: /((olla|sart[eé]n).*(quemad|pegad))|((grasa).*(olla|sart[eé]n))/i, queries: ['desengrasante cocina', 'antigrasa', 'pasta limpiadora pink', 'limpieza acero inoxidable'] },
+  // parrilla / BBQ
+  { test: /(parrilla|bbq|grill)/i, queries: ['limpiador parrilla', 'goo gone bbq', 'desengrasante parrilla'] },
+  // alfombra / tapiz
+  { test: /(alfombra|tapiz|tapicer)/i, queries: ['limpiador alfombra', 'quitamanchas alfombra', 'limpieza tapicería'] },
+  // vidrio / ventanas / espejos
+  { test: /(vidrio|ventan|espej).*(limpiar|mancha|grasa|sarro)|limpia\s*vidri/i, queries: ['limpia vidrios', 'spray vidrios', 'limpiador cristales'] },
+  // acero inoxidable
+  { test: /(acero\s*inox|inoxidable)/i, queries: ['limpiador acero inoxidable', 'acero inoxidable spray'] },
+  // protector/impermeabilizante telas (sofá/sillón/tapiz)
+  { test: /(protector|impermeabiliz).*(sill[oó]n|sof[aá]|tapiz|tela)/i, queries: ['protector textil', 'impermeabilizante telas', 'fabric protector'] },
+  // ducha/baño + moho/sarro/juntas
+  { test: /(bañ|ducha).*(moho|hongo|sarro|juntas?)/i, queries: ['antihongos baño', 'limpia juntas', 'desincrustante baño'] },
+  // grasa cocina general
+  { test: /(cocina).*(grasa|desengras)/i, queries: ['desengrasante cocina', 'antigrasa', 'limpiador multiuso cocina'] },
+  // pisos madera
+  { test: /(piso[s]?|madera).*(limpiar|abrillant|brillo)/i, queries: ['limpiador pisos madera', 'limpieza pisos madera', 'abrillantador madera'] },
+];
+
+function ruleBasedQueries(userText=''){
+  const q = String(userText||'');
+  const found = new Set();
+  for (const r of CONTEXT_RULES){
+    if (r.test.test(q)) r.queries.forEach(x=>found.add(x));
+  }
+  return Array.from(found);
+}
+
+async function searchByRuleQueries(queries=[], max=6){
+  if (!queries.length) return [];
+  const pool=[]; const seen=new Set();
+  for (const q of queries.slice(0, 10)){
+    const found = await searchProductsPlain(q, 12).catch(()=>[]);
+    for (const it of found){
+      if (!seen.has(it.handle)){
+        seen.add(it.handle);
+        pool.push(it);
+        if (pool.length >= max*3) break;
+      }
+    }
+    if (pool.length >= max*3) break;
+  }
+  const ranked = await pickTopWithRelevance(pool, queries, max*2);
+  return await preferInStock(ranked, max);
 }
 
 /* ----- Intents ----- */
@@ -360,7 +447,6 @@ app.post('/chat', async (req,res)=>{
         const lines = custom.map(b=>[b.title,b.url,b.image||''].join('|')).join('\n');
         return res.json({ text: `BRANDS:\n${lines}` });
       }
-      // generar desde vendors
       const d = await gql(`query{ products(first:120){ edges{ node{ vendor } } } }`);
       const vendors = (d.products?.edges||[]).map(e=>String(e.node.vendor||'').trim()).filter(Boolean);
       const top = Array.from(new Set(vendors)).slice(0,48);
@@ -436,12 +522,12 @@ app.post('/chat', async (req,res)=>{
       if (picks && picks.length){
         return res.json({ text: `Te dejo una opción por ítem:\n\n${buildProductsMarkdown(picks)}` });
       }
-      // si no hubo match, caemos a IA+browse
+      // si no hubo match, caemos a flujo normal
     }
 
     /* ---- IA para info (paso a paso) + recomendaciones reales desde Shopify ---- */
     if (intent === 'info' || intent === 'browse'){
-      // 1) Mini plan con IA (bloque TIP:)
+      // 1) Mini plan con IA (TIP:)
       let tipText = '';
       try{
         const ai = await openai.chat.completions.create({
@@ -457,40 +543,31 @@ app.post('/chat', async (req,res)=>{
         console.warn('[ai] fallo mini plan', err?.message||err);
       }
 
-      // 2) Recomendaciones (IA → keywords/marcas → Shopify)
+      // 2) BÚSQUEDA DE PRODUCTOS — ORDEN NUEVO:
       let items = [];
+
+      // 2.a) REGLAS POR CONTEXTO (más específicas)
       try{
-        const { keywords, brands, max } = await aiProductQuery(message||'');
-        if (keywords.length || brands.length){
-          items = await searchByQueries(keywords, brands, Math.min(6, max));
+        const rbq = ruleBasedQueries(message||'');
+        if (rbq.length){
+          items = await searchByRuleQueries(rbq, 6);
         }
-      }catch(err){
-        console.warn('[searchByQueries] error', err?.message||err);
+      }catch(e){ console.warn('[ruleBased] error', e?.message||e); }
+
+      // 2.b) TÍTULO: frase + palabras clave
+      if (!items.length){
+        items = await titleMatchProducts(message||'', 6);
       }
 
-      // Fallbacks por reglas y por título si aún está vacío
+      // 2.c) IA → keywords/marcas (FALLBACK FINAL) + re-filtro de relevancia
       if (!items.length){
-        const qn = norm(message||'');
-        if (/(impermeabiliz|protector).*(sillon|sof[aá]|tapiz)/.test(qn)) {
-          items = await searchProductsPlain('protector textil', 12).then(xs=>preferInStock(xs,3));
-        } else if (/(olla).*(quemad)/.test(qn)) {
-          const pool = [];
-          for (const q of ['pink stuff pasta','desengrasante cocina','limpieza acero inox']){
-            const found = await searchProductsPlain(q, 6); pool.push(...found);
+        try{
+          const { keywords, brands, max } = await aiProductQuery(message||'');
+          if (keywords.length || brands.length){
+            items = await searchByQueries(keywords, brands, Math.min(6, max));
           }
-          items = await preferInStock(pool,3);
-        } else if (/(mesa|vidrio).*(limpiar|mancha|grasa|sarro)/.test(qn) || /limpia\s*vidri/.test(qn)) {
-          items = await searchProductsPlain('limpia vidrios', 10).then(xs=>preferInStock(xs,3));
-        } else if (/(lavalozas|lava loza|lavaplatos)/.test(qn)) {
-          items = await searchProductsPlain('lavalozas', 12).then(xs=>preferInStock(xs,6));
-        } else if (/(parrilla|bbq|grill)/.test(qn)) {
-          const pool = [];
-          for (const q of ['limpiador parrilla','goo gone bbq','desengrasante parrilla']) {
-            const found = await searchProductsPlain(q, 6); pool.push(...found);
-          }
-          items = await preferInStock(pool,6);
-        } else {
-          items = await titleMatchProducts(message||'', 6);
+        }catch(err){
+          console.warn('[searchByQueries] error', err?.message||err);
         }
       }
 
@@ -516,3 +593,4 @@ app.post('/chat', async (req,res)=>{
 app.get('/health', (_,res)=>res.json({ ok:true }));
 const port = PORT || process.env.PORT || 3000;
 app.listen(port, ()=>console.log('ML Chat server on :'+port));
+
