@@ -284,7 +284,37 @@ app.post('/chat', async (req,res)=>{
     // post-tool (cart)
     if (toolResult?.id) return res.json({ text: "¡Listo! Producto agregado 👍" });
 
-    const intent = detectIntent(message||'');
+    const rawMsg = String(message || '');
+    const intent = detectIntent(rawMsg);
+
+    /* ---- FOLLOW-UP: "recomiéndame N opciones para: ____" ---- */
+    {
+      const qFold = fold(rawMsg);
+      const m = qFold.match(/^recomiendame\s+(\d{1,2})?\s*opciones?\s*para\s*:?/i);
+      if (m) {
+        // cantidad pedida (1..6, default 2)
+        let want = parseInt(m[1] || '2', 10);
+        if (Number.isNaN(want)) want = 2;
+        want = Math.max(1, Math.min(6, want));
+
+        // extraer query "bonita" del mensaje original (con acentos)
+        let query = rawMsg;
+        const colon = rawMsg.indexOf(':');
+        if (colon >= 0) {
+          query = rawMsg.slice(colon + 1).trim();
+        } else {
+          query = rawMsg.replace(/^\s*recom[ií]endame\s+(\d{1,2})?\s*opciones?\s*para\s*/i, '').trim();
+        }
+        if (!query) query = rawMsg; // fallback
+
+        let items = await titleMatchProducts(query, want * 3);
+        items = await preferInStock(items, want);
+
+        const text = buildProductsMarkdown(items) || `No encontré coincidencias exactas para "${query}". ¿Alguna marca o superficie?`;
+        return res.json({ text });
+      }
+    }
+    /* --------------------------------------------------------- */
 
     /* ---- Más vendidos ---- */
     if (intent === 'tops'){
@@ -347,7 +377,7 @@ app.post('/chat', async (req,res)=>{
 
     /* ---- Envíos (cuando escribe la región/comuna) ---- */
     if (intent === 'shipping_region'){
-      const q = String(message||'').trim();
+      const q = String(rawMsg||'').trim();
       if (REGIONES_F.has(fold(q)) || /^env[ií]o\s+/i.test(q)) {
         const reg = q.replace(/^env[ií]o\s+/i,'').trim();
         const ship = shippingByRegionName(reg);
@@ -373,7 +403,7 @@ app.post('/chat', async (req,res)=>{
 
     /* ---- Shopping list (varios ítems) ---- */
     if (intent === 'shopping'){
-      const picks = await selectProductsByOrderedKeywords(message||'');
+      const picks = await selectProductsByOrderedKeywords(rawMsg||'');
       if (picks && picks.length){
         return res.json({ text: `Te dejo una opción por ítem:\n\n${buildProductsMarkdown(picks)}` });
       }
@@ -389,7 +419,7 @@ app.post('/chat', async (req,res)=>{
           model: 'gpt-4o-mini',
           messages: [
             { role: 'system', content: AI_POLICY },
-            { role: 'user', content: message || '' }
+            { role: 'user', content: rawMsg || '' }
           ]
         });
         const out = (ai.choices?.[0]?.message?.content || '').trim();
@@ -402,7 +432,7 @@ app.post('/chat', async (req,res)=>{
       let items = [];
 
       // mapeos útiles (mejor precisión)
-      const qn = norm(message||'');
+      const qn = norm(rawMsg||'');
       if (/(impermeabiliz|protector).*(sillon|sof[aá]|tapiz)/.test(qn)) {
         items = await searchProductsPlain('protector textil', 12).then(xs=>preferInStock(xs,3));
       } else if (/(olla).*(quemad)/.test(qn)) {
@@ -423,7 +453,7 @@ app.post('/chat', async (req,res)=>{
         items = await preferInStock(pool,6);
       } else {
         // scoring por título + stock
-        items = await titleMatchProducts(message||'', 6);
+        items = await titleMatchProducts(rawMsg||'', 6);
       }
 
       const list = items.length ? `\n\n${buildProductsMarkdown(items)}` : '';
@@ -449,3 +479,4 @@ app.post('/chat', async (req,res)=>{
 app.get('/health', (_,res)=>res.json({ ok:true }));
 const port = PORT || process.env.PORT || 3000;
 app.listen(port, ()=>console.log('ML Chat server on :'+port));
+
