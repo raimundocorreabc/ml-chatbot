@@ -1,4 +1,4 @@
-// server.js — IA-first + categorías/brands/envíos/regiones/shopping-list sólidos (con desambiguación "Paso" y follow-up)
+// server.js — IA-first + categorías/brands/envíos/regiones/shopping-list sólidos
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
@@ -144,18 +144,14 @@ const SHIPPING_ZONES = [
   { zone:'ZONA NORTE',           cost:10990, regions:['Arica y Parinacota','Tarapacá','Tarapaca','Antofagasta','Atacama'] },
   { zone:'ZONA AUSTRAL',         cost:14990, regions:['Aysén','Aysen','Magallanes'] }
 ];
-const REGION_COST_MAP = (()=>{
-  const m=new Map();
-  for(const z of SHIPPING_ZONES) for(const r of z.regions) m.set(fold(r),{zone:z.zone,cost:z.cost});
-  m.set('metropolitana',{zone:'REGIÓN METROPOLITANA',cost:3990});
-  m.set('santiago',{zone:'REGIÓN METROPOLITANA',cost:3990});
-  return m;
-})();
+const REGION_COST_MAP = (()=>{ const m=new Map(); for(const z of SHIPPING_ZONES) for(const r of z.regions) m.set(fold(r),{zone:z.zone,cost:z.cost}); m.set('metropolitana',{zone:'REGIÓN METROPOLITANA',cost:3990}); m.set('santiago',{zone:'REGIÓN METROPOLITANA',cost:3990}); return m; })();
 const shippingByRegionName = (s='') => REGION_COST_MAP.get(fold(s)) || null;
 
 function regionsPayloadLines(){
+  // Chips de regiones (para que el front lo muestre como carrusel y haga “envío <región>” al click)
   const uniq = Array.from(new Set(REGIONES_LIST.map(r=>r.replace(/\"/g,''))));
-  return uniq.map(r => `${r}|${r}`).join('\n'); // "Titulo|Valor"
+  // Formato: "Titulo|ValorAlClick"
+  return uniq.map(r => `${r}|${r}`).join('\n');
 }
 
 /* ----- Shopping list (1 por ítem, mismo orden) ----- */
@@ -169,15 +165,12 @@ const SHOPPING_SYNONYMS = {
   'alfombra':  ['limpiador alfombra','tapiceria','tapiz','dr beckmann'],
   'vidrio':    ['limpia vidrios','glass cleaner','weiman glass'],
   'acero':     ['limpiador acero inoxidable','weiman acero'],
-  'protector textil': ['protector textil','impermeabilizante telas','fabric protector'],
-  // mejoras típicas
-  'antihongos': ['antihongos','anti hongos','antihongo','moho','removedor moho','spray moho','hongo baño','hongos baño'],
-  'antisarro':  ['anti sarro','antisarro','desincrustante','removedor sarro','sarro','calcáreo','calcareo','ducha sarro','grifería sarro','griferia sarro'],
-  'toalla nova':['toalla nova','toallas nova','nova','papel toalla','toalla de papel','rollo cocina nova'],
+  'protector textil': ['protector textil','impermeabilizante telas','fabric protector']
 };
 const tokenize = s => norm(s).replace(/[^a-z0-9\s]/g,' ').split(/\s+/).filter(Boolean);
 
 function splitShopping(text=''){
+  // Acepta: "necesito: lavalozas, esponja, limpiador de parrilla y limpiador de alfombra"
   const afterColon = text.split(':');
   const base = afterColon.length > 1 ? afterColon.slice(1).join(':') : text;
   return base.split(/,|\by\b/gi).map(s=>s.trim()).filter(Boolean);
@@ -185,6 +178,7 @@ function splitShopping(text=''){
 
 async function bestMatchForPhrase(phrase){
   const p = phrase.toLowerCase().trim();
+  // mapear a sinónimos si exacto
   const syn = SHOPPING_SYNONYMS[p] || [p];
   const pool=[]; const seen=new Set();
   for (const q of syn){
@@ -192,6 +186,7 @@ async function bestMatchForPhrase(phrase){
     for (const it of found){ if(!seen.has(it.handle)){ seen.add(it.handle); pool.push(it);} }
   }
   if (!pool.length) {
+    // fallback: usa tokens relevantes del texto
     const tokens = tokenize(phrase).filter(t=>t.length>=3).slice(0,3);
     for(const t of tokens){
       const found = await searchProductsPlain(t, 6).catch(()=>[]);
@@ -204,7 +199,7 @@ async function bestMatchForPhrase(phrase){
 
 async function selectProductsByOrderedKeywords(message){
   const parts = splitShopping(message);
-  if (parts.length < 2) return null;
+  if (parts.length < 2) return null; // solo disparar este flujo cuando pidió varios
   const picks=[]; const used=new Set();
   for (const seg of parts){
     const m = await bestMatchForPhrase(seg);
@@ -244,35 +239,6 @@ async function titleMatchProducts(queryText, max=6){
   return ordered;
 }
 
-/* ----- Pivotes de intención (follow-up robusto) ----- */
-function intentPivots(text=''){
-  const q = norm(text);
-  const pivots = [];
-  if (/(hongo|moho)/.test(q)) { pivots.push('antihongos','removedor moho','spray moho baño'); }
-  if (/(sarro|calc|incrust)/.test(q) || /(ducha|grifer[ií]a|ba[ñn]o).*(sarro)/.test(q)) {
-    pivots.push('anti sarro','desincrustante','limpiador sarro baño');
-  }
-  if (/impermeabiliz/.test(q)) {
-    if (/(sill[oó]n|sof[aá]|tapiz|tela|zapat|chaquet)/.test(q)) pivots.push('protector textil');
-    if (/(piedra|m[áa]rmol|marmol|porcelanato|cer[aá]mica)/.test(q)) pivots.push('lithofin impermeabilizante','sellador piedra');
-    if (/madera/.test(q)) pivots.push('protector madera');
-  }
-  if (/(organizaci[oó]n|organizar|ordenar espacios|utensilios)/.test(q)) {
-    pivots.push('organizadores','cajas organizadoras');
-  }
-  return Array.from(new Set(pivots));
-}
-async function searchByPivots(text, max=6){
-  const pivots = intentPivots(text);
-  if (!pivots.length) return [];
-  const pool=[]; const seen=new Set();
-  for (const q of pivots){
-    const found = await searchProductsPlain(q, Math.min(12, max*3)).catch(()=>[]);
-    for (const it of found){ if(!seen.has(it.handle)){ seen.add(it.handle); pool.push(it); } }
-  }
-  return pool.length ? (await preferInStock(pool, max)) : [];
-}
-
 /* ----- IA ----- */
 const AI_POLICY = `
 Eres el asistente de MundoLimpio.cl (Chile), experto en limpieza.
@@ -288,6 +254,7 @@ const PURPOSE_REGEX = /\b(para que sirve|para qué sirve|que es|qué es|como usa
 function detectIntent(text=''){
   const q = norm(text);
 
+  // Si viene "envío <lugar>", intenta rutear directo a shipping_region
   const m = String(text||'').match(/^env[ií]o\s+(.+)$/i);
   if (m) {
     const loc = fold(m[1]);
@@ -301,6 +268,7 @@ function detectIntent(text=''){
   if (/(que marcas|qué marcas|marcas venden|marcas disponibles)/.test(q)) return 'brands';
   if (/(categorias|categorías|tipos de productos|colecciones|que productos venden|qué productos venden)/.test(q)) return 'categories';
   if (PURPOSE_REGEX.test(text)) return 'info';
+  // shopping-list si trae comas o "necesito:"
   if (/,/.test(text) || /necesito:|lista:|comprar:|quiero:/.test(q)) return 'shopping';
   return 'browse';
 }
@@ -316,53 +284,7 @@ app.post('/chat', async (req,res)=>{
     // post-tool (cart)
     if (toolResult?.id) return res.json({ text: "¡Listo! Producto agregado 👍" });
 
-    const rawMsg = String(message || '');
-    const qTrim = rawMsg.trim();
-    const qFold = fold(qTrim);
-
-    /* ---- FOLLOW-UP explícito: "recomiéndame N opciones para: ____" ---- */
-    {
-      const m = rawMsg.match(/^\s*recom[ií]endame\s+(\d{1,2})?\s*opciones?\s*para\s*:?\s*(.+)$/i);
-      if (m) {
-        let want = parseInt(m[1] || '2', 10);
-        if (Number.isNaN(want)) want = 2;
-        want = Math.max(1, Math.min(6, want));
-
-        let query = (m[2] || '').trim() || rawMsg;
-
-        // 1) pivotes por intención
-        let items = await searchByPivots(query, want);
-
-        // 2) si no alcanza, scoring por título + stock
-        if (!items.length) {
-          const scored = await titleMatchProducts(query, want * 3);
-          items = await preferInStock(scored, want);
-        }
-
-        const text = buildProductsMarkdown(items) || `No encontré coincidencias exactas para "${query}". ¿Alguna marca o superficie?`;
-        return res.json({ text });
-      }
-    }
-
-    /* ---- Desambiguación "paso": ¿marca o rechazo? ---- */
-    if (/^paso$/i.test(qTrim)) {
-      try {
-        const found = await searchProductsPlain('Paso', 12).catch(()=>[]);
-        if (found.length) {
-          const picks = await preferInStock(found, 6);
-          return res.json({ text: `Aquí tienes opciones de la marca Paso:\n\n${buildProductsMarkdown(picks)}` });
-        }
-      } catch {}
-      // si no hay marca "Paso", lo tomamos como rechazo cortés
-      return res.json({ text: "¡Sin problema! Cuando quieras seguimos y te sugiero productos ✨" });
-    }
-
-    // otros rechazos corteses comunes
-    if (/^(no gracias|gracias,\s*no|gracias no|despu[eé]s|otra\s*vez|ahora no|no por ahora)$/i.test(qFold)) {
-      return res.json({ text: "¡Sin problema! Cuando quieras seguimos y te sugiero productos ✨" });
-    }
-
-    const intent = detectIntent(rawMsg||'');
+    const intent = detectIntent(message||'');
 
     /* ---- Más vendidos ---- */
     if (intent === 'tops'){
@@ -378,6 +300,7 @@ app.post('/chat', async (req,res)=>{
         const lines = custom.map(b=>[b.title,b.url,b.image||''].join('|')).join('\n');
         return res.json({ text: `BRANDS:\n${lines}` });
       }
+      // generar desde vendors
       const d = await gql(`query{ products(first:120){ edges{ node{ vendor } } } }`);
       const vendors = (d.products?.edges||[]).map(e=>String(e.node.vendor||'').trim()).filter(Boolean);
       const top = Array.from(new Set(vendors)).slice(0,48);
@@ -395,6 +318,7 @@ app.post('/chat', async (req,res)=>{
         const payload = cols.map(c=>`${c.title}|${BASE}/collections/${c.handle}`).join('\n');
         return res.json({ text: `CATS:\n${payload}` });
       }
+      // fallback: chips hacia búsqueda por palabras (sin inventar handles)
       const fallback = [
         ['LIMPIEZA Y ASEO', `${BASE}/search?q=limpieza`],
         ['LAVADO DE ROPA',  `${BASE}/search?q=ropa`],
@@ -423,7 +347,7 @@ app.post('/chat', async (req,res)=>{
 
     /* ---- Envíos (cuando escribe la región/comuna) ---- */
     if (intent === 'shipping_region'){
-      const q = String(rawMsg||'').trim();
+      const q = String(message||'').trim();
       if (REGIONES_F.has(fold(q)) || /^env[ií]o\s+/i.test(q)) {
         const reg = q.replace(/^env[ií]o\s+/i,'').trim();
         const ship = shippingByRegionName(reg);
@@ -449,7 +373,7 @@ app.post('/chat', async (req,res)=>{
 
     /* ---- Shopping list (varios ítems) ---- */
     if (intent === 'shopping'){
-      const picks = await selectProductsByOrderedKeywords(rawMsg||'');
+      const picks = await selectProductsByOrderedKeywords(message||'');
       if (picks && picks.length){
         return res.json({ text: `Te dejo una opción por ítem:\n\n${buildProductsMarkdown(picks)}` });
       }
@@ -465,9 +389,8 @@ app.post('/chat', async (req,res)=>{
           model: 'gpt-4o-mini',
           messages: [
             { role: 'system', content: AI_POLICY },
-            { role: 'user', content: rawMsg || '' }
-          ],
-          temperature: 0.5
+            { role: 'user', content: message || '' }
+          ]
         });
         const out = (ai.choices?.[0]?.message?.content || '').trim();
         if (out) tipText = `TIP: ${out}`;
@@ -475,32 +398,32 @@ app.post('/chat', async (req,res)=>{
         console.warn('[ai] fallo mini plan', err?.message||err);
       }
 
-      // 2) Recomendaciones de productos (primero pivotes, luego reglas, luego scoring)
-      let items = await searchByPivots(rawMsg, 6);
+      // 2) Recomendaciones de productos (precisas)
+      let items = [];
 
-      if (!items.length) {
-        const qn = norm(rawMsg||'');
-        if (/(impermeabiliz|protector).*(sillon|sof[aá]|tapiz)/.test(qn)) {
-          items = await searchProductsPlain('protector textil', 12).then(xs=>preferInStock(xs,3));
-        } else if (/(olla).*(quemad)/.test(qn)) {
-          const pool = [];
-          for (const q of ['pink stuff pasta','desengrasante cocina','limpieza acero inox']){
-            const found = await searchProductsPlain(q, 6); pool.push(...found);
-          }
-          items = await preferInStock(pool,3);
-        } else if (/(mesa|vidrio).*(limpiar|mancha|grasa|sarro)/.test(qn) || /limpia\s*vidri/.test(qn)) {
-          items = await searchProductsPlain('limpia vidrios', 10).then(xs=>preferInStock(xs,3));
-        } else if (/(lavalozas|lava loza|lavaplatos)/.test(qn)) {
-          items = await searchProductsPlain('lavalozas', 12).then(xs=>preferInStock(xs,6));
-        } else if (/(parrilla|bbq|grill)/.test(qn)) {
-          const pool = [];
-          for (const q of ['limpiador parrilla','goo gone bbq','desengrasante parrilla']) {
-            const found = await searchProductsPlain(q, 6); pool.push(...found);
-          }
-          items = await preferInStock(pool,6);
-        } else {
-          items = await titleMatchProducts(rawMsg||'', 6);
+      // mapeos útiles (mejor precisión)
+      const qn = norm(message||'');
+      if (/(impermeabiliz|protector).*(sillon|sof[aá]|tapiz)/.test(qn)) {
+        items = await searchProductsPlain('protector textil', 12).then(xs=>preferInStock(xs,3));
+      } else if (/(olla).*(quemad)/.test(qn)) {
+        const pool = [];
+        for (const q of ['pink stuff pasta','desengrasante cocina','limpieza acero inox']){
+          const found = await searchProductsPlain(q, 6); pool.push(...found);
         }
+        items = await preferInStock(pool,3);
+      } else if (/(mesa|vidrio).*(limpiar|mancha|grasa|sarro)/.test(qn) || /limpia\s*vidri/.test(qn)) {
+        items = await searchProductsPlain('limpia vidrios', 10).then(xs=>preferInStock(xs,3));
+      } else if (/(lavalozas|lava loza|lavaplatos)/.test(qn)) {
+        items = await searchProductsPlain('lavalozas', 12).then(xs=>preferInStock(xs,6));
+      } else if (/(parrilla|bbq|grill)/.test(qn)) {
+        const pool = [];
+        for (const q of ['limpiador parrilla','goo gone bbq','desengrasante parrilla']) {
+          const found = await searchProductsPlain(q, 6); pool.push(...found);
+        }
+        items = await preferInStock(pool,6);
+      } else {
+        // scoring por título + stock
+        items = await titleMatchProducts(message||'', 6);
       }
 
       const list = items.length ? `\n\n${buildProductsMarkdown(items)}` : '';
@@ -508,6 +431,7 @@ app.post('/chat', async (req,res)=>{
         ? `TIP: Hola, ${meta.userFirstName} 👋 | Te faltan ${fmtCLP(Number(FREE_TH||FREE_TH_DEFAULT) - Number(meta?.cartSubtotalCLP||0))} para envío gratis en RM\n\n`
         : '';
 
+      // si no hay IA, al menos devolvemos productos
       const finalText = (tipText ? `${greet}${tipText}${list}` : (list || 'No encontré coincidencias exactas. ¿Me das una pista más (marca, superficie, aroma)?'));
       return res.json({ text: finalText });
     }
