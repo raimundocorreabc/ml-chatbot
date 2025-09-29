@@ -1,4 +1,4 @@
-// server.js — IA-first + catálogo/brands/envíos/regiones/shopping-list + IA→keywords→Shopify + STOCK
+// server.js — IA-first + catálogo/brands/envíos/regiones/shopping-list + IA→keywords→Shopify + STOCK (Storefront)
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
@@ -51,7 +51,10 @@ async function gql(query, variables = {}) {
   const url = `https://${SHOPIFY_STORE_DOMAIN}/api/${SF_API_VERSION}/graphql.json`;
   const r = await fetch(url, {
     method: 'POST',
-    headers: {'Content-Type':'application/json', 'X-Shopify-Storefront-Access-Token': SHOPIFY_STOREFRONT_TOKEN},
+    headers: {
+      'Content-Type':'application/json',
+      'X-Shopify-Storefront-Access-Token': SHOPIFY_STOREFRONT_TOKEN
+    },
     body: JSON.stringify({ query, variables })
   });
   if (!r.ok) throw new Error('Storefront API '+r.status);
@@ -234,6 +237,61 @@ async function titleMatchProducts(queryText, max=6){
   return ordered;
 }
 
+/* ----- Stock via Storefront: quantityAvailable por variante ----- */
+async function getVariantQuantitiesByHandle(handle){
+  const data = await gql(`
+    query($h: String!) {
+      productByHandle(handle: $h) {
+        title
+        variants(first: 100) {
+          edges {
+            node {
+              id
+              title
+              sku
+              availableForSale
+              quantityAvailable   # requiere storefront unauthenticated_read_product_inventory
+            }
+          }
+        }
+      }
+    }
+  `, { h: handle });
+
+  const p = data.productByHandle;
+  if (!p) return null;
+
+  const variants = (p.variants?.edges || []).map(e => {
+    const n = e.node;
+    const qty = (typeof n.quantityAvailable === 'number') ? n.quantityAvailable : null;
+    return {
+      id: n.id,
+      title: n.title || 'Default Title',
+      sku: n.sku || null,
+      available: !!n.availableForSale,
+      quantityAvailable: qty
+    };
+  });
+
+  const hasNumeric = variants.some(v => typeof v.quantityAvailable === 'number');
+  const total = hasNumeric
+    ? variants.reduce((sum,v) => sum + (typeof v.quantityAvailable === 'number' ? v.quantityAvailable : 0), 0)
+    : null;
+
+  return { title: p.title, variants, total };
+}
+
+/* ---------- STOCK helpers/intents ---------- */
+const STOCK_REGEX = /\b(stock|disponible|disponibilidad|quedan|hay unidades|inventario)\b/i;
+
+function extractHandleFromText(s=''){
+  const m = String(s||'').match(/\/products\/([a-z0-9\-_%.]+)/i);
+  return m ? m[1] : null;
+}
+function detectStockIntent(text=''){
+  return STOCK_REGEX.test(text || '');
+}
+
 /* ----- IA (TIP sin CTA) ----- */
 const AI_POLICY = `
 Eres el asistente de MundoLimpio.cl (Chile), experto en limpieza.
@@ -309,17 +367,6 @@ async function searchByQueries(keywords=[], brands=[], max=6){
   return await preferInStock(pool, max);
 }
 
-/* ---------- STOCK helpers/intents ---------- */
-const STOCK_REGEX = /\b(stock|disponible|disponibilidad|quedan|hay unidades|inventario)\b/i;
-
-function extractHandleFromText(s=''){
-  const m = String(s||'').match(/\/products\/([a-z0-9\-_%.]+)/i);
-  return m ? m[1] : null;
-}
-function detectStockIntent(text=''){
-  return STOCK_REGEX.test(text || '');
-}
-
 /* ----- Intents ----- */
 const PURPOSE_REGEX = /\b(para que sirve|para qué sirve|que es|qué es|como usar|cómo usar|modo de uso|instrucciones|paso a paso|como limpiar|cómo limpiar|consejos|tips|guia|guía|pasos)\b/i;
 
@@ -353,79 +400,51 @@ app.post('/chat', async (req,res)=>{
     const { message, toolResult, meta={} } = req.body;
     const FREE_TH = Number(FREE_SHIPPING_THRESHOLD_CLP ?? FREE_TH_DEFAULT);
 
-    /* ----------- POST-TOOL HANDLER ----------- */
+    // Mantener post-tool de “agregar al carrito”
     if (toolResult?.id) {
-      // Si viene respuesta del tool de STOCK (front retorna { ok, data })
-      const r = toolResult.result;
-      if (r && typeof r === 'object' && ('ok' in r)) {
-        if (!r.ok) return res.json({ text: `No pude leer el stock: ${r.error || 'error desconocido'}` });
-        const data = r.data || {};
-        const title = data.title || 'Producto';
-        const total = (typeof data.total === 'number') ? data.total : null;
-        const vars  = Array.isArray(data.variants) ? data.variants : [];
-
-        // Construcción de respuesta
-        if (total !== null) {
-          // Tenemos cantidad exacta (sumatoria de inventory_quantity expuesta)
-          const lines = [];
-          const withQty = vars.filter(v => typeof v.inventory_quantity === 'number');
-          if (withQty.length) {
-            for (const v of withQty) {
-              lines.push(`- ${v.title || 'Variante'}: ${v.inventory_quantity} unidad(es) ${v.available ? '' : '(no disponible)'}`
-                .replace(/\s+/g,' ').trim());
-            }
-          } else {
-            const avail = vars.filter(v => v.available).length;
-            if (avail) lines.push(`Veo ${avail} variante(s) con stock.`);
-          }
-          const detail = lines.length ? `\n${lines.join('\n')}` : '';
-          return res.json({ text: `**Stock de ${title}**: ${total} unidad(es) en total.${detail}` });
-        }
-
-        // Sin cantidad exacta → al menos decir qué variantes están disponibles
-        const avail = vars.filter(v => v.available);
-        if (avail.length) {
-          const lines = avail.map(v => `- ${v.title || 'Variante'}: disponible`);
-          return res.json({ text: `De **${title}** no tengo el número exacto, pero sí veo disponibilidad:\n${lines.join('\n')}` });
-        }
-        return res.json({ text: `De **${title}** no veo stock disponible ahora mismo.` });
-      }
-
-      // Fallback histórico (add to cart): mantener comportamiento anterior
       return res.json({ text: "¡Listo! Producto agregado 👍" });
     }
 
-    /* ----------- INTENTS ----------- */
     const intent = detectIntent(message||'');
 
-    /* ---- STOCK ---- */
+    /* ---- STOCK (Storefront, sin toolCalls) ---- */
     if (intent === 'stock') {
-      // 1) intentar desde el propio mensaje (si pegó un link)
+      // 1) intentar handle desde el mensaje
       let handle = extractHandleFromText(message || '');
-
-      // 2) si está en una PDP, sacar el handle desde meta.page.url
+      // 2) desde la URL de la página (si es PDP)
       if (!handle && meta?.page?.url && /\/products\//i.test(meta.page.url)) {
         handle = extractHandleFromText(meta.page.url);
       }
-
-      // 3) último intento: buscar por título con lo que escribió
+      // 3) buscar por título
       if (!handle) {
         try {
           const found = await titleMatchProducts(message || '', 1);
           if (found && found[0]) handle = found[0].handle;
         } catch {}
       }
-
       if (!handle) {
-        return res.json({ text: "Pásame el link del producto (o abre la página del producto) y te digo el stock al tiro." });
+        return res.json({ text: "Pásame el link o el nombre exacto del producto y te digo el stock al tiro." });
       }
 
-      // Devolver tool call hacia el front para que ejecute getStockClient(handle)
-      const callId = 'stk_' + Date.now();
-      return res.json({
-        text: "Consultando stock…",
-        toolCalls: [{ name: "getStockClient", id: callId, arguments: { handle } }]
-      });
+      const info = await getVariantQuantitiesByHandle(handle).catch(()=>null);
+      if (!info || !info.variants?.length) {
+        return res.json({ text: "No pude leer el stock de ese producto ahora mismo." });
+      }
+
+      if (info.total !== null) {
+        const lines = info.variants
+          .filter(v => typeof v.quantityAvailable === 'number')
+          .map(v => `- ${v.title}: **${v.quantityAvailable}** unidad(es)${v.available ? '' : ' (no disponible)'}`);
+        const detail = lines.length ? `\n${lines.join('\n')}` : '';
+        return res.json({ text: `**Stock de ${info.title}**: **${info.total}** unidad(es) en total.${detail}` });
+      }
+
+      const avail = info.variants.filter(v => v.available);
+      if (avail.length) {
+        const lines = avail.map(v => `- ${v.title}: disponible`);
+        return res.json({ text: `De **${info.title}** no tengo el número exacto, pero sí veo disponibilidad:\n${lines.join('\n')}` });
+      }
+      return res.json({ text: `De **${info.title}** no veo stock disponible ahora mismo.` });
     }
 
     /* ---- Más vendidos ---- */
@@ -442,7 +461,6 @@ app.post('/chat', async (req,res)=>{
         const lines = custom.map(b=>[b.title,b.url,b.image||''].join('|')).join('\n');
         return res.json({ text: `BRANDS:\n${lines}` });
       }
-      // generar desde vendors
       const d = await gql(`query{ products(first:120){ edges{ node{ vendor } } } }`);
       const vendors = (d.products?.edges||[]).map(e=>String(e.node.vendor||'').trim()).filter(Boolean);
       const top = Array.from(new Set(vendors)).slice(0,48);
@@ -521,9 +539,8 @@ app.post('/chat', async (req,res)=>{
       // si no hubo match, caemos a IA+browse
     }
 
-    /* ---- IA para info (paso a paso) + recomendaciones reales desde Shopify ---- */
+    /* ---- IA para info (paso a paso) + recomendaciones desde Shopify ---- */
     if (intent === 'info' || intent === 'browse'){
-      // 1) Mini plan con IA (bloque TIP:)
       let tipText = '';
       try{
         const ai = await openai.chat.completions.create({
@@ -539,7 +556,6 @@ app.post('/chat', async (req,res)=>{
         console.warn('[ai] fallo mini plan', err?.message||err);
       }
 
-      // 2) Recomendaciones (IA → keywords/marcas → Shopify)
       let items = [];
       try{
         const { keywords, brands, max } = await aiProductQuery(message||'');
@@ -550,7 +566,6 @@ app.post('/chat', async (req,res)=>{
         console.warn('[searchByQueries] error', err?.message||err);
       }
 
-      // Fallbacks por reglas y por título si aún está vacío
       if (!items.length){
         const qn = norm(message||'');
         if (/(impermeabiliz|protector).*(sillon|sof[aá]|tapiz)/.test(qn)) {
@@ -598,4 +613,3 @@ app.post('/chat', async (req,res)=>{
 app.get('/health', (_,res)=>res.json({ ok:true }));
 const port = PORT || process.env.PORT || 3000;
 app.listen(port, ()=>console.log('ML Chat server on :'+port));
-
