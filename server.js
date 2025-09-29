@@ -1,4 +1,4 @@
-// server.js — IA-first + catálogo/brands/envíos/regiones/shopping-list + IA→keywords→Shopify + STOCK (mejorado)
+// server.js — IA-first + catálogo/brands/envíos/regiones/shopping-list + IA→keywords→Shopify + STOCK (formateo ordenado)
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
@@ -140,7 +140,7 @@ const COMUNAS_F = new Set(COMUNAS.map(fold));
 
 const SHIPPING_ZONES = [
   { zone:'REGIÓN METROPOLITANA', cost:3990,  regions:['Metropolitana','Santiago'] },
-  { zone:'ZONA CENTRAL',         cost:6990,  regions:['Coquimbo','Valparaíso','Valparaiso',"O’Higgins","O'Higgins",'Maule','Ñuble','Nuble','Biobío','Biobio','Araucanía','Araucania','Los Ríos','Los Rios','Los Lagos'] },
+  { zone:'ZONA CENTRAL',         cost:6990,  regions:['Coquimbo','Valparaíso','Valparaiso',"O’Higgs","O'Higgins",'Maule','Ñuble','Nuble','Biobío','Biobio','Araucanía','Araucania','Los Ríos','Los Rios','Los Lagos'] },
   { zone:'ZONA NORTE',           cost:10990, regions:['Arica y Parinacota','Tarapacá','Tarapaca','Antofagasta','Atacama'] },
   { zone:'ZONA AUSTRAL',         cost:14990, regions:['Aysén','Aysen','Magallanes'] }
 ];
@@ -312,114 +312,20 @@ async function searchByQueries(keywords=[], brands=[], max=6){
 /* ---------- STOCK helpers/intents (mejorados) ---------- */
 const STOCK_REGEX = /\b(stock|disponible|disponibilidad|quedan|hay unidades|inventario)\b/i;
 
-function detectStockIntent(text=''){
-  return STOCK_REGEX.test(text || '');
-}
-
 function extractHandleFromText(s=''){
   const m = String(s||'').match(/\/products\/([a-z0-9\-_%.]+)/i);
   return m ? m[1] : null;
 }
-
-/* Limpia preguntas de stock para quedarnos con el nombre del producto */
-function cleanStockQuery(text=''){
-  let q = String(text||'').toLowerCase();
-  q = q
-    .replace(/\b(cuanto|cuá?nto|cuantos|cuá?ntos|hay|tienen|queda[n]?|de|del|la|el)\b/gi,' ')
-    .replace(/\b(stock|inventario|disponible|disponibilidad|unidades?)\b/gi,' ')
-    .replace(/\s+/g,' ')
-    .trim();
-  return q;
+function detectStockIntent(text=''){
+  return STOCK_REGEX.test(text || '');
 }
 
-/* Búsqueda robusta del producto más probable a partir de texto libre */
-async function resolveHandleForStock(text='', meta={}){
-  // 1) Si viene handle en el texto, úsalo
-  let handle = extractHandleFromText(text);
-  if (handle) return handle;
-
-  // 2) Si estamos en una PDP, úsalo
-  if (!handle && meta?.page?.url && /\/products\//i.test(meta.page.url)) {
-    handle = extractHandleFromText(meta.page.url);
-    if (handle) return handle;
-  }
-
-  // 3) Intentos de búsqueda progresiva
-  const q0 = cleanStockQuery(text);
-  const candidates = [];
-  const tried = new Set();
-
-  async function pushFound(query, take=6){
-    if (!query || tried.has(query)) return;
-    tried.add(query);
-    const found = await searchProductsPlain(query, take).catch(()=>[]);
-    for (const it of found) candidates.push(it);
-  }
-
-  // intento directo con la frase limpia
-  await pushFound(q0, 12);
-
-  // si tiene números/medidas (“500 ml”, “48 gr”), busca también sin unidad
-  const qNoUnits = q0.replace(/\b(\d+)\s*(ml|gr|g|kg|lts?|l)\b/ig, '$1');
-  if (qNoUnits !== q0) await pushFound(qNoUnits, 10);
-
-  // divide en tokens y prueba combinaciones 2–3 palabras
-  const toks = q0.split(/\s+/).filter(Boolean).slice(0,6);
-  for (let i=0; i<toks.length; i++){
-    for (let j=i+1; j<Math.min(toks.length, i+3); j++){
-      await pushFound(`${toks[i]} ${toks[j]}`, 6);
-    }
-  }
-
-  // fallback de título-match existente
-  if (!candidates.length){
-    const best = await titleMatchProducts(text, 1);
-    if (best && best[0]) return best[0].handle;
-  }
-
-  if (!candidates.length) return null;
-
-  // prioriza disponibles y elimina duplicados, quedándote con el primero
-  const seen = new Set();
-  const ordered = [
-    ...candidates.filter(c => c.availableForSale && !seen.has(c.handle) && seen.add(c.handle)),
-    ...candidates.filter(c => !seen.has(c.handle) && seen.add(c.handle))
-  ];
-  return ordered[0]?.handle || null;
+// NUEVOS helpers de formato
+function pluralUnidad(n){
+  return (Number(n) === 1) ? 'unidad' : 'unidades';
 }
-
-/* Lee cantidades por variante desde Storefront (quantityAvailable) */
-async function getVariantQuantitiesByHandle(handle){
-  const d = await gql(`
-    query($h:String!){
-      productByHandle(handle:$h){
-        title
-        variants(first: 50){
-          edges{
-            node{
-              title
-              availableForSale
-              quantityAvailable
-            }
-          }
-        }
-      }
-    }
-  `,{ h: handle });
-
-  const p = d.productByHandle;
-  if (!p) return null;
-
-  const variants = (p.variants?.edges||[]).map(e => ({
-    title: e.node.title || 'Variante',
-    available: !!e.node.availableForSale,
-    quantityAvailable: (typeof e.node.quantityAvailable === 'number') ? e.node.quantityAvailable : null
-  }));
-
-  const qtys = variants.map(v => v.quantityAvailable).filter(v => typeof v === 'number');
-  const total = qtys.length ? qtys.reduce((a,b)=>a+b,0) : null;
-
-  return { title: p.title || 'Producto', variants, total };
+function isDefaultVariantTitle(t=''){
+  return /default\s*title/i.test(String(t));
 }
 
 /* ----- Intents ----- */
@@ -449,6 +355,47 @@ function detectIntent(text=''){
 
 function parseBrandCarouselConfig(){ try { return JSON.parse(BRAND_CAROUSEL_JSON||''); } catch { return []; } }
 
+/* ====== Storefront stock (sin Admin) ====== */
+async function fetchStorefrontStockByHandle(handle){
+  // Busca producto por handle y obtiene variantes con quantityAvailable/availableForSale
+  const d = await gql(`
+    query($h:String!){
+      productByHandle(handle:$h){
+        title
+        variants(first: 100){
+          edges{
+            node{
+              title
+              availableForSale
+              quantityAvailable
+            }
+          }
+        }
+      }
+    }
+  `, { h: handle });
+
+  const p = d.productByHandle;
+  if (!p) return null;
+
+  const variants = (p.variants?.edges || []).map(e => ({
+    title: e.node.title || 'Default Title',
+    available: !!e.node.availableForSale,
+    quantityAvailable: (typeof e.node.quantityAvailable === 'number') ? e.node.quantityAvailable : null,
+  }));
+
+  const totals = variants
+    .map(v => (typeof v.quantityAvailable === 'number' ? v.quantityAvailable : 0))
+    .reduce((a,b)=>a+b,0);
+
+  const hasAnyNumber = variants.some(v => typeof v.quantityAvailable === 'number');
+  return {
+    title: p.title || 'Producto',
+    variants,
+    total: hasAnyNumber ? totals : null
+  };
+}
+
 /* =============== Endpoint =============== */
 app.post('/chat', async (req,res)=>{
   try{
@@ -457,7 +404,7 @@ app.post('/chat', async (req,res)=>{
 
     /* ----------- POST-TOOL HANDLER ----------- */
     if (toolResult?.id) {
-      // sólo mantener confirmación para add-to-cart
+      // soporte futuro a tools; mantenemos add-to-cart legacy
       return res.json({ text: "¡Listo! Producto agregado 👍" });
     }
 
@@ -466,36 +413,70 @@ app.post('/chat', async (req,res)=>{
 
     /* ---- STOCK (Storefront) ---- */
     if (intent === 'stock') {
-      const handle = await resolveHandleForStock(message || '', meta);
+      // 1) intentar desde el propio mensaje (si pegó un link)
+      let handle = extractHandleFromText(message || '');
+
+      // 2) si está en una PDP, sacar el handle desde meta.page.url
+      if (!handle && meta?.page?.url && /\/products\//i.test(meta.page.url)) {
+        handle = extractHandleFromText(meta.page.url);
+      }
+
+      // 3) último intento: buscar por título con lo que escribió
+      if (!handle) {
+        try {
+          const found = await titleMatchProducts(message || '', 1);
+          if (found && found[0]) handle = found[0].handle;
+        } catch {}
+      }
 
       if (!handle) {
-        return res.json({
-          text: "Para indicarte el **stock exacto**, necesito el **nombre del producto** o su **link**. Por ejemplo: “Protector Textil 500 ml”."
-        });
+        return res.json({ text: "Pásame el link del producto o su nombre exacto y te digo el stock." });
       }
 
-      const info = await getVariantQuantitiesByHandle(handle).catch(()=>null);
-      if (!info || !info.variants?.length) {
-        return res.json({ text: "No pude obtener el stock de ese producto en este momento." });
+      // Consultar cantidades via Storefront
+      const info = await fetchStorefrontStockByHandle(handle);
+      if (!info) {
+        return res.json({ text: "No encontré ese producto. ¿Puedes confirmarme el nombre o enviar el link?" });
       }
 
-      // Respuesta ordenada
+      // Respuesta ordenada (con redacción clara)
       if (info.total !== null) {
-        const lines = info.variants
-          .filter(v => typeof v.quantityAvailable === 'number')
-          .map(v => `- ${v.title}: **${v.quantityAvailable}** unidad(es)${v.available ? '' : ' (no disponible)'}`);
-        const detail = lines.length ? `\n${lines.join('\n')}` : '';
+        const qty = info.total;
+        const header = `Actualmente contamos con **${qty} ${pluralUnidad(qty)}** disponibles de **${info.title}**.`;
+
+        // ¿Cuántas variantes con cantidad exacta?
+        const withQty = info.variants.filter(v => typeof v.quantityAvailable === 'number');
+
+        let detail = '';
+        if (withQty.length === 1) {
+          // Un solo SKU (o variante “Default Title”)
+          const v = withQty[0];
+          const label = isDefaultVariantTitle(v.title) ? 'Stock disponible' : `Variante ${v.title} — Stock`;
+          detail = `\n${label}: **${v.quantityAvailable} ${pluralUnidad(v.quantityAvailable)}**${v.available ? '' : ' (no disponible)'}`;
+        } else if (withQty.length > 1) {
+          // Varias variantes con cantidad
+          const lines = withQty.map(v => {
+            const name = isDefaultVariantTitle(v.title) ? 'Variante única' : `Variante ${v.title}`;
+            return `- ${name}: **${v.quantityAvailable} ${pluralUnidad(v.quantityAvailable)}**${v.available ? '' : ' (no disponible)'}`;
+          });
+          detail = `\n${lines.join('\n')}`;
+        }
+
         return res.json({
-          text: `**Stock de ${info.title}**\n**Total:** ${info.total} unidad(es)${detail ? `\n${detail}` : ''}`
+          text: `${header}${detail}`
         });
       }
 
       // Cuando la tienda no expone cantidad exacta, informar disponibilidad por variante
       const avail = info.variants.filter(v => v.available);
       if (avail.length) {
-        const lines = avail.map(v => `- ${v.title}: **disponible**`);
+        const header = `Disponibilidad de **${info.title}**:`;
+        const lines = avail.map(v => {
+          const name = isDefaultVariantTitle(v.title) ? 'Variante única' : `Variante ${v.title}`;
+          return `- ${name}: **disponible**`;
+        });
         return res.json({
-          text: `**Disponibilidad de ${info.title}**\n${lines.join('\n')}`
+          text: `${header}\n${lines.join('\n')}`
         });
       }
 
@@ -672,3 +653,4 @@ app.post('/chat', async (req,res)=>{
 app.get('/health', (_,res)=>res.json({ ok:true }));
 const port = PORT || process.env.PORT || 3000;
 app.listen(port, ()=>console.log('ML Chat server on :'+port));
+
