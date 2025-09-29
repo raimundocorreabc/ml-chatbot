@@ -1,4 +1,4 @@
-// server.js — IA-first + catálogo/brands/envíos/regiones/shopping-list + IA→keywords→Shopify
+// server.js — IA-first + catálogo/brands/envíos/regiones/shopping-list + IA→keywords→Shopify + STOCK
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
@@ -206,7 +206,7 @@ async function selectProductsByOrderedKeywords(message){
 /* ----- Búsqueda precisa por título (fallback) ----- */
 function extractKeywords(text='', max=8){
   const tokens = tokenize(text).filter(t => t.length>=3);
-  const stop = new Set(['tienen','venden','quiero','necesito','precio','productos','producto','limpieza','limpiar','ayuda','me','puedes','recomendar']);
+  const stop = new Set(['tienen','venden','quiero','necesito','precio','productos','producto','limpieza','limpiar','ayuda','me','puedes','recomendar','stock','disponible','disponibilidad','quedan','inventario']);
   const bag=[]; const seen=new Set();
   for (const t of tokens){
     if (stop.has(t)) continue;
@@ -309,6 +309,17 @@ async function searchByQueries(keywords=[], brands=[], max=6){
   return await preferInStock(pool, max);
 }
 
+/* ---------- STOCK helpers/intents ---------- */
+const STOCK_REGEX = /\b(stock|disponible|disponibilidad|quedan|hay unidades|inventario)\b/i;
+
+function extractHandleFromText(s=''){
+  const m = String(s||'').match(/\/products\/([a-z0-9\-_%.]+)/i);
+  return m ? m[1] : null;
+}
+function detectStockIntent(text=''){
+  return STOCK_REGEX.test(text || '');
+}
+
 /* ----- Intents ----- */
 const PURPOSE_REGEX = /\b(para que sirve|para qué sirve|que es|qué es|como usar|cómo usar|modo de uso|instrucciones|paso a paso|como limpiar|cómo limpiar|consejos|tips|guia|guía|pasos)\b/i;
 
@@ -322,6 +333,7 @@ function detectIntent(text=''){
     if (REGIONES_F.has(loc) || COMUNAS_F.has(loc)) return 'shipping_region';
   }
 
+  if (detectStockIntent(text)) return 'stock';
   if (REGIONES_F.has(fold(text)) || COMUNAS_F.has(fold(text))) return 'shipping_region';
   if (/(mas vendidos|más vendidos|best sellers|top ventas|lo mas vendido|lo más vendido)/.test(q)) return 'tops';
   if (/(envio|env[ií]o|despacho|retiro)/.test(q)) return 'shipping';
@@ -341,10 +353,80 @@ app.post('/chat', async (req,res)=>{
     const { message, toolResult, meta={} } = req.body;
     const FREE_TH = Number(FREE_SHIPPING_THRESHOLD_CLP ?? FREE_TH_DEFAULT);
 
-    // post-tool (cart)
-    if (toolResult?.id) return res.json({ text: "¡Listo! Producto agregado 👍" });
+    /* ----------- POST-TOOL HANDLER ----------- */
+    if (toolResult?.id) {
+      // Si viene respuesta del tool de STOCK (front retorna { ok, data })
+      const r = toolResult.result;
+      if (r && typeof r === 'object' && ('ok' in r)) {
+        if (!r.ok) return res.json({ text: `No pude leer el stock: ${r.error || 'error desconocido'}` });
+        const data = r.data || {};
+        const title = data.title || 'Producto';
+        const total = (typeof data.total === 'number') ? data.total : null;
+        const vars  = Array.isArray(data.variants) ? data.variants : [];
 
+        // Construcción de respuesta
+        if (total !== null) {
+          // Tenemos cantidad exacta (sumatoria de inventory_quantity expuesta)
+          const lines = [];
+          const withQty = vars.filter(v => typeof v.inventory_quantity === 'number');
+          if (withQty.length) {
+            for (const v of withQty) {
+              lines.push(`- ${v.title || 'Variante'}: ${v.inventory_quantity} unidad(es) ${v.available ? '' : '(no disponible)'}`
+                .replace(/\s+/g,' ').trim());
+            }
+          } else {
+            const avail = vars.filter(v => v.available).length;
+            if (avail) lines.push(`Veo ${avail} variante(s) con stock.`);
+          }
+          const detail = lines.length ? `\n${lines.join('\n')}` : '';
+          return res.json({ text: `**Stock de ${title}**: ${total} unidad(es) en total.${detail}` });
+        }
+
+        // Sin cantidad exacta → al menos decir qué variantes están disponibles
+        const avail = vars.filter(v => v.available);
+        if (avail.length) {
+          const lines = avail.map(v => `- ${v.title || 'Variante'}: disponible`);
+          return res.json({ text: `De **${title}** no tengo el número exacto, pero sí veo disponibilidad:\n${lines.join('\n')}` });
+        }
+        return res.json({ text: `De **${title}** no veo stock disponible ahora mismo.` });
+      }
+
+      // Fallback histórico (add to cart): mantener comportamiento anterior
+      return res.json({ text: "¡Listo! Producto agregado 👍" });
+    }
+
+    /* ----------- INTENTS ----------- */
     const intent = detectIntent(message||'');
+
+    /* ---- STOCK ---- */
+    if (intent === 'stock') {
+      // 1) intentar desde el propio mensaje (si pegó un link)
+      let handle = extractHandleFromText(message || '');
+
+      // 2) si está en una PDP, sacar el handle desde meta.page.url
+      if (!handle && meta?.page?.url && /\/products\//i.test(meta.page.url)) {
+        handle = extractHandleFromText(meta.page.url);
+      }
+
+      // 3) último intento: buscar por título con lo que escribió
+      if (!handle) {
+        try {
+          const found = await titleMatchProducts(message || '', 1);
+          if (found && found[0]) handle = found[0].handle;
+        } catch {}
+      }
+
+      if (!handle) {
+        return res.json({ text: "Pásame el link del producto (o abre la página del producto) y te digo el stock al tiro." });
+      }
+
+      // Devolver tool call hacia el front para que ejecute getStockClient(handle)
+      const callId = 'stk_' + Date.now();
+      return res.json({
+        text: "Consultando stock…",
+        toolCalls: [{ name: "getStockClient", id: callId, arguments: { handle } }]
+      });
+    }
 
     /* ---- Más vendidos ---- */
     if (intent === 'tops'){
@@ -516,3 +598,4 @@ app.post('/chat', async (req,res)=>{
 app.get('/health', (_,res)=>res.json({ ok:true }));
 const port = PORT || process.env.PORT || 3000;
 app.listen(port, ()=>console.log('ML Chat server on :'+port));
+
