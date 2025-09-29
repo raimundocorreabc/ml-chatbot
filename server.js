@@ -1,4 +1,4 @@
-// server.js — IA-first + catálogo/brands/envíos/regiones/shopping-list + IA→keywords→Shopify + STOCK (Storefront)
+// server.js — IA-first + catálogo/brands/envíos/regiones/shopping-list + IA→keywords→Shopify + STOCK (mejorado)
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
@@ -51,10 +51,7 @@ async function gql(query, variables = {}) {
   const url = `https://${SHOPIFY_STORE_DOMAIN}/api/${SF_API_VERSION}/graphql.json`;
   const r = await fetch(url, {
     method: 'POST',
-    headers: {
-      'Content-Type':'application/json',
-      'X-Shopify-Storefront-Access-Token': SHOPIFY_STOREFRONT_TOKEN
-    },
+    headers: {'Content-Type':'application/json', 'X-Shopify-Storefront-Access-Token': SHOPIFY_STOREFRONT_TOKEN},
     body: JSON.stringify({ query, variables })
   });
   if (!r.ok) throw new Error('Storefront API '+r.status);
@@ -237,61 +234,6 @@ async function titleMatchProducts(queryText, max=6){
   return ordered;
 }
 
-/* ----- Stock via Storefront: quantityAvailable por variante ----- */
-async function getVariantQuantitiesByHandle(handle){
-  const data = await gql(`
-    query($h: String!) {
-      productByHandle(handle: $h) {
-        title
-        variants(first: 100) {
-          edges {
-            node {
-              id
-              title
-              sku
-              availableForSale
-              quantityAvailable   # requiere storefront unauthenticated_read_product_inventory
-            }
-          }
-        }
-      }
-    }
-  `, { h: handle });
-
-  const p = data.productByHandle;
-  if (!p) return null;
-
-  const variants = (p.variants?.edges || []).map(e => {
-    const n = e.node;
-    const qty = (typeof n.quantityAvailable === 'number') ? n.quantityAvailable : null;
-    return {
-      id: n.id,
-      title: n.title || 'Default Title',
-      sku: n.sku || null,
-      available: !!n.availableForSale,
-      quantityAvailable: qty
-    };
-  });
-
-  const hasNumeric = variants.some(v => typeof v.quantityAvailable === 'number');
-  const total = hasNumeric
-    ? variants.reduce((sum,v) => sum + (typeof v.quantityAvailable === 'number' ? v.quantityAvailable : 0), 0)
-    : null;
-
-  return { title: p.title, variants, total };
-}
-
-/* ---------- STOCK helpers/intents ---------- */
-const STOCK_REGEX = /\b(stock|disponible|disponibilidad|quedan|hay unidades|inventario)\b/i;
-
-function extractHandleFromText(s=''){
-  const m = String(s||'').match(/\/products\/([a-z0-9\-_%.]+)/i);
-  return m ? m[1] : null;
-}
-function detectStockIntent(text=''){
-  return STOCK_REGEX.test(text || '');
-}
-
 /* ----- IA (TIP sin CTA) ----- */
 const AI_POLICY = `
 Eres el asistente de MundoLimpio.cl (Chile), experto en limpieza.
@@ -367,6 +309,119 @@ async function searchByQueries(keywords=[], brands=[], max=6){
   return await preferInStock(pool, max);
 }
 
+/* ---------- STOCK helpers/intents (mejorados) ---------- */
+const STOCK_REGEX = /\b(stock|disponible|disponibilidad|quedan|hay unidades|inventario)\b/i;
+
+function detectStockIntent(text=''){
+  return STOCK_REGEX.test(text || '');
+}
+
+function extractHandleFromText(s=''){
+  const m = String(s||'').match(/\/products\/([a-z0-9\-_%.]+)/i);
+  return m ? m[1] : null;
+}
+
+/* Limpia preguntas de stock para quedarnos con el nombre del producto */
+function cleanStockQuery(text=''){
+  let q = String(text||'').toLowerCase();
+  q = q
+    .replace(/\b(cuanto|cuá?nto|cuantos|cuá?ntos|hay|tienen|queda[n]?|de|del|la|el)\b/gi,' ')
+    .replace(/\b(stock|inventario|disponible|disponibilidad|unidades?)\b/gi,' ')
+    .replace(/\s+/g,' ')
+    .trim();
+  return q;
+}
+
+/* Búsqueda robusta del producto más probable a partir de texto libre */
+async function resolveHandleForStock(text='', meta={}){
+  // 1) Si viene handle en el texto, úsalo
+  let handle = extractHandleFromText(text);
+  if (handle) return handle;
+
+  // 2) Si estamos en una PDP, úsalo
+  if (!handle && meta?.page?.url && /\/products\//i.test(meta.page.url)) {
+    handle = extractHandleFromText(meta.page.url);
+    if (handle) return handle;
+  }
+
+  // 3) Intentos de búsqueda progresiva
+  const q0 = cleanStockQuery(text);
+  const candidates = [];
+  const tried = new Set();
+
+  async function pushFound(query, take=6){
+    if (!query || tried.has(query)) return;
+    tried.add(query);
+    const found = await searchProductsPlain(query, take).catch(()=>[]);
+    for (const it of found) candidates.push(it);
+  }
+
+  // intento directo con la frase limpia
+  await pushFound(q0, 12);
+
+  // si tiene números/medidas (“500 ml”, “48 gr”), busca también sin unidad
+  const qNoUnits = q0.replace(/\b(\d+)\s*(ml|gr|g|kg|lts?|l)\b/ig, '$1');
+  if (qNoUnits !== q0) await pushFound(qNoUnits, 10);
+
+  // divide en tokens y prueba combinaciones 2–3 palabras
+  const toks = q0.split(/\s+/).filter(Boolean).slice(0,6);
+  for (let i=0; i<toks.length; i++){
+    for (let j=i+1; j<Math.min(toks.length, i+3); j++){
+      await pushFound(`${toks[i]} ${toks[j]}`, 6);
+    }
+  }
+
+  // fallback de título-match existente
+  if (!candidates.length){
+    const best = await titleMatchProducts(text, 1);
+    if (best && best[0]) return best[0].handle;
+  }
+
+  if (!candidates.length) return null;
+
+  // prioriza disponibles y elimina duplicados, quedándote con el primero
+  const seen = new Set();
+  const ordered = [
+    ...candidates.filter(c => c.availableForSale && !seen.has(c.handle) && seen.add(c.handle)),
+    ...candidates.filter(c => !seen.has(c.handle) && seen.add(c.handle))
+  ];
+  return ordered[0]?.handle || null;
+}
+
+/* Lee cantidades por variante desde Storefront (quantityAvailable) */
+async function getVariantQuantitiesByHandle(handle){
+  const d = await gql(`
+    query($h:String!){
+      productByHandle(handle:$h){
+        title
+        variants(first: 50){
+          edges{
+            node{
+              title
+              availableForSale
+              quantityAvailable
+            }
+          }
+        }
+      }
+    }
+  `,{ h: handle });
+
+  const p = d.productByHandle;
+  if (!p) return null;
+
+  const variants = (p.variants?.edges||[]).map(e => ({
+    title: e.node.title || 'Variante',
+    available: !!e.node.availableForSale,
+    quantityAvailable: (typeof e.node.quantityAvailable === 'number') ? e.node.quantityAvailable : null
+  }));
+
+  const qtys = variants.map(v => v.quantityAvailable).filter(v => typeof v === 'number');
+  const total = qtys.length ? qtys.reduce((a,b)=>a+b,0) : null;
+
+  return { title: p.title || 'Producto', variants, total };
+}
+
 /* ----- Intents ----- */
 const PURPOSE_REGEX = /\b(para que sirve|para qué sirve|que es|qué es|como usar|cómo usar|modo de uso|instrucciones|paso a paso|como limpiar|cómo limpiar|consejos|tips|guia|guía|pasos)\b/i;
 
@@ -400,51 +455,51 @@ app.post('/chat', async (req,res)=>{
     const { message, toolResult, meta={} } = req.body;
     const FREE_TH = Number(FREE_SHIPPING_THRESHOLD_CLP ?? FREE_TH_DEFAULT);
 
-    // Mantener post-tool de “agregar al carrito”
+    /* ----------- POST-TOOL HANDLER ----------- */
     if (toolResult?.id) {
+      // sólo mantener confirmación para add-to-cart
       return res.json({ text: "¡Listo! Producto agregado 👍" });
     }
 
+    /* ----------- INTENTS ----------- */
     const intent = detectIntent(message||'');
 
-    /* ---- STOCK (Storefront, sin toolCalls) ---- */
+    /* ---- STOCK (Storefront) ---- */
     if (intent === 'stock') {
-      // 1) intentar handle desde el mensaje
-      let handle = extractHandleFromText(message || '');
-      // 2) desde la URL de la página (si es PDP)
-      if (!handle && meta?.page?.url && /\/products\//i.test(meta.page.url)) {
-        handle = extractHandleFromText(meta.page.url);
-      }
-      // 3) buscar por título
+      const handle = await resolveHandleForStock(message || '', meta);
+
       if (!handle) {
-        try {
-          const found = await titleMatchProducts(message || '', 1);
-          if (found && found[0]) handle = found[0].handle;
-        } catch {}
-      }
-      if (!handle) {
-        return res.json({ text: "Pásame el link o el nombre exacto del producto y te digo el stock al tiro." });
+        return res.json({
+          text: "Para indicarte el **stock exacto**, necesito el **nombre del producto** o su **link**. Por ejemplo: “Protector Textil 500 ml”."
+        });
       }
 
       const info = await getVariantQuantitiesByHandle(handle).catch(()=>null);
       if (!info || !info.variants?.length) {
-        return res.json({ text: "No pude leer el stock de ese producto ahora mismo." });
+        return res.json({ text: "No pude obtener el stock de ese producto en este momento." });
       }
 
+      // Respuesta ordenada
       if (info.total !== null) {
         const lines = info.variants
           .filter(v => typeof v.quantityAvailable === 'number')
           .map(v => `- ${v.title}: **${v.quantityAvailable}** unidad(es)${v.available ? '' : ' (no disponible)'}`);
         const detail = lines.length ? `\n${lines.join('\n')}` : '';
-        return res.json({ text: `**Stock de ${info.title}**: **${info.total}** unidad(es) en total.${detail}` });
+        return res.json({
+          text: `**Stock de ${info.title}**\n**Total:** ${info.total} unidad(es)${detail ? `\n${detail}` : ''}`
+        });
       }
 
+      // Cuando la tienda no expone cantidad exacta, informar disponibilidad por variante
       const avail = info.variants.filter(v => v.available);
       if (avail.length) {
-        const lines = avail.map(v => `- ${v.title}: disponible`);
-        return res.json({ text: `De **${info.title}** no tengo el número exacto, pero sí veo disponibilidad:\n${lines.join('\n')}` });
+        const lines = avail.map(v => `- ${v.title}: **disponible**`);
+        return res.json({
+          text: `**Disponibilidad de ${info.title}**\n${lines.join('\n')}`
+        });
       }
-      return res.json({ text: `De **${info.title}** no veo stock disponible ahora mismo.` });
+
+      return res.json({ text: `Por ahora **${info.title}** no muestra stock disponible.` });
     }
 
     /* ---- Más vendidos ---- */
@@ -461,6 +516,7 @@ app.post('/chat', async (req,res)=>{
         const lines = custom.map(b=>[b.title,b.url,b.image||''].join('|')).join('\n');
         return res.json({ text: `BRANDS:\n${lines}` });
       }
+      // generar desde vendors
       const d = await gql(`query{ products(first:120){ edges{ node{ vendor } } } }`);
       const vendors = (d.products?.edges||[]).map(e=>String(e.node.vendor||'').trim()).filter(Boolean);
       const top = Array.from(new Set(vendors)).slice(0,48);
@@ -539,8 +595,9 @@ app.post('/chat', async (req,res)=>{
       // si no hubo match, caemos a IA+browse
     }
 
-    /* ---- IA para info (paso a paso) + recomendaciones desde Shopify ---- */
+    /* ---- IA para info (paso a paso) + recomendaciones reales desde Shopify ---- */
     if (intent === 'info' || intent === 'browse'){
+      // 1) Mini plan con IA (bloque TIP:)
       let tipText = '';
       try{
         const ai = await openai.chat.completions.create({
@@ -556,6 +613,7 @@ app.post('/chat', async (req,res)=>{
         console.warn('[ai] fallo mini plan', err?.message||err);
       }
 
+      // 2) Recomendaciones (IA → keywords/marcas → Shopify)
       let items = [];
       try{
         const { keywords, brands, max } = await aiProductQuery(message||'');
@@ -566,6 +624,7 @@ app.post('/chat', async (req,res)=>{
         console.warn('[searchByQueries] error', err?.message||err);
       }
 
+      // Fallbacks por reglas y por título si aún está vacío
       if (!items.length){
         const qn = norm(message||'');
         if (/(impermeabiliz|protector).*(sillon|sof[aá]|tapiz)/.test(qn)) {
