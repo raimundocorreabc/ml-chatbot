@@ -1,4 +1,4 @@
-// server.js — IA-first + catálogo/brands/envíos/regiones/shopping-list + IA→keywords→Shopify + STOCK (formateo ordenado)
+// server.js — IA-first + catálogo/brands/envíos/regiones/shopping-list + IA→keywords→Shopify + STOCK (formato refinado)
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
@@ -140,7 +140,7 @@ const COMUNAS_F = new Set(COMUNAS.map(fold));
 
 const SHIPPING_ZONES = [
   { zone:'REGIÓN METROPOLITANA', cost:3990,  regions:['Metropolitana','Santiago'] },
-  { zone:'ZONA CENTRAL',         cost:6990,  regions:['Coquimbo','Valparaíso','Valparaiso',"O’Higgs","O'Higgins",'Maule','Ñuble','Nuble','Biobío','Biobio','Araucanía','Araucania','Los Ríos','Los Rios','Los Lagos'] },
+  { zone:'ZONA CENTRAL',         cost:6990,  regions:['Coquimbo','Valparaíso','Valparaiso',"O’Higgins","O'Higgins",'Maule','Ñuble','Nuble','Biobío','Biobio','Araucanía','Araucania','Los Ríos','Los Rios','Los Lagos'] },
   { zone:'ZONA NORTE',           cost:10990, regions:['Arica y Parinacota','Tarapacá','Tarapaca','Antofagasta','Atacama'] },
   { zone:'ZONA AUSTRAL',         cost:14990, regions:['Aysén','Aysen','Magallanes'] }
 ];
@@ -206,7 +206,7 @@ async function selectProductsByOrderedKeywords(message){
 /* ----- Búsqueda precisa por título (fallback) ----- */
 function extractKeywords(text='', max=8){
   const tokens = tokenize(text).filter(t => t.length>=3);
-  const stop = new Set(['tienen','venden','quiero','necesito','precio','productos','producto','limpieza','limpiar','ayuda','me','puedes','recomendar','stock','disponible','disponibilidad','quedan','inventario']);
+  const stop = new Set(['tienen','venden','quiero','necesito','precio','productos','producto','limpieza','limpiar','ayuda','me','puedes','recomendar','stock','stok','disponible','disponibilidad','quedan','inventario','cuanto','cuánta','cuánta']);
   const bag=[]; const seen=new Set();
   for (const t of tokens){
     if (stop.has(t)) continue;
@@ -249,8 +249,8 @@ Dada la consulta del cliente, responde SOLO con un JSON así:
 {"keywords":["antihongos","limpiador baño"],"brands":["Paso"],"max":6}
 
 Reglas:
-- "keywords": 2–4 términos (español de Chile) de categoría/superficie/uso: ej. "antihongos", "desengrasante cocina", "limpiador alfombra", "parrilla".
-- "brands": SOLO si el usuario la mencionó (ej.: "Paso","Astonish","Goo Gone","Weiman","Bona","Dr Beckmann","Lithofin","Vileda","Cif","Nova","Cascade"). No inventes marcas.
+- "keywords": 2–4 términos (español de Chile) de categoría/superficie/uso.
+- "brands": SOLO si el usuario la mencionó (no inventes).
 - "max": entre 3 y 8 (por defecto 6).
 - Devuelve JSON válido. Nada fuera del JSON.
 `;
@@ -309,8 +309,9 @@ async function searchByQueries(keywords=[], brands=[], max=6){
   return await preferInStock(pool, max);
 }
 
-/* ---------- STOCK helpers/intents (mejorados) ---------- */
-const STOCK_REGEX = /\b(stock|disponible|disponibilidad|quedan|hay unidades|inventario)\b/i;
+/* ---------- STOCK helpers/intents (refinados) ---------- */
+// incluye 'stok' (sin c) y otras señales
+const STOCK_REGEX = /\b(stock|stok|disponible|disponibilidad|quedan|hay\s+unidades|inventario)\b/i;
 
 function extractHandleFromText(s=''){
   const m = String(s||'').match(/\/products\/([a-z0-9\-_%.]+)/i);
@@ -320,13 +321,10 @@ function detectStockIntent(text=''){
   return STOCK_REGEX.test(text || '');
 }
 
-// NUEVOS helpers de formato
-function pluralUnidad(n){
-  return (Number(n) === 1) ? 'unidad' : 'unidades';
-}
-function isDefaultVariantTitle(t=''){
-  return /default\s*title/i.test(String(t));
-}
+// Formatos
+function pluralUnidad(n){ return (Number(n) === 1) ? 'unidad' : 'unidades'; }
+function pluralDisponible(n){ return (Number(n) === 1) ? 'disponible' : 'disponibles'; }
+function isDefaultVariantTitle(t=''){ return /default\s*title/i.test(String(t)); }
 
 /* ----- Intents ----- */
 const PURPOSE_REGEX = /\b(para que sirve|para qué sirve|que es|qué es|como usar|cómo usar|modo de uso|instrucciones|paso a paso|como limpiar|cómo limpiar|consejos|tips|guia|guía|pasos)\b/i;
@@ -357,7 +355,6 @@ function parseBrandCarouselConfig(){ try { return JSON.parse(BRAND_CAROUSEL_JSON
 
 /* ====== Storefront stock (sin Admin) ====== */
 async function fetchStorefrontStockByHandle(handle){
-  // Busca producto por handle y obtiene variantes con quantityAvailable/availableForSale
   const d = await gql(`
     query($h:String!){
       productByHandle(handle:$h){
@@ -404,7 +401,6 @@ app.post('/chat', async (req,res)=>{
 
     /* ----------- POST-TOOL HANDLER ----------- */
     if (toolResult?.id) {
-      // soporte futuro a tools; mantenemos add-to-cart legacy
       return res.json({ text: "¡Listo! Producto agregado 👍" });
     }
 
@@ -413,15 +409,12 @@ app.post('/chat', async (req,res)=>{
 
     /* ---- STOCK (Storefront) ---- */
     if (intent === 'stock') {
-      // 1) intentar desde el propio mensaje (si pegó un link)
       let handle = extractHandleFromText(message || '');
 
-      // 2) si está en una PDP, sacar el handle desde meta.page.url
       if (!handle && meta?.page?.url && /\/products\//i.test(meta.page.url)) {
         handle = extractHandleFromText(meta.page.url);
       }
 
-      // 3) último intento: buscar por título con lo que escribió
       if (!handle) {
         try {
           const found = await titleMatchProducts(message || '', 1);
@@ -430,54 +423,54 @@ app.post('/chat', async (req,res)=>{
       }
 
       if (!handle) {
-        return res.json({ text: "Pásame el link del producto o su nombre exacto y te digo el stock." });
+        return res.json({ text: "Compárteme el **link** del producto o su **nombre exacto** y te digo el stock." });
       }
 
-      // Consultar cantidades via Storefront
       const info = await fetchStorefrontStockByHandle(handle);
       if (!info) {
         return res.json({ text: "No encontré ese producto. ¿Puedes confirmarme el nombre o enviar el link?" });
       }
 
-      // Respuesta ordenada (con redacción clara)
       if (info.total !== null) {
         const qty = info.total;
-        const header = `Actualmente contamos con **${qty} ${pluralUnidad(qty)}** disponibles de **${info.title}**.`;
+        const header = `Actualmente contamos con ${qty} ${pluralUnidad(qty)} ${pluralDisponible(qty)} de **${info.title}**.`;
 
-        // ¿Cuántas variantes con cantidad exacta?
         const withQty = info.variants.filter(v => typeof v.quantityAvailable === 'number');
 
-        let detail = '';
+        // Bloque "Stock disponible" (si hay un solo SKU o “Default Title”, queda muy limpio)
         if (withQty.length === 1) {
-          // Un solo SKU (o variante “Default Title”)
           const v = withQty[0];
-          const label = isDefaultVariantTitle(v.title) ? 'Stock disponible' : `Variante ${v.title} — Stock`;
-          detail = `\n${label}: **${v.quantityAvailable} ${pluralUnidad(v.quantityAvailable)}**${v.available ? '' : ' (no disponible)'}`;
-        } else if (withQty.length > 1) {
-          // Varias variantes con cantidad
-          const lines = withQty.map(v => {
-            const name = isDefaultVariantTitle(v.title) ? 'Variante única' : `Variante ${v.title}`;
-            return `- ${name}: **${v.quantityAvailable} ${pluralUnidad(v.quantityAvailable)}**${v.available ? '' : ' (no disponible)'}`;
+          const label = isDefaultVariantTitle(v.title) ? '**Stock disponible:**' : `**Variante ${v.title} — Stock:**`;
+          return res.json({
+            text: `${header}\n${label} ${v.quantityAvailable} ${pluralUnidad(v.quantityAvailable)}`
           });
-          detail = `\n${lines.join('\n')}`;
         }
 
+        if (withQty.length > 1) {
+          const lines = withQty.map(v => {
+            const name = isDefaultVariantTitle(v.title) ? 'Variante única' : `Variante ${v.title}`;
+            return `- ${name}: ${v.quantityAvailable} ${pluralUnidad(v.quantityAvailable)}`;
+          });
+          return res.json({
+            text: `${header}\n**Detalle por variante:**\n${lines.join('\n')}`
+          });
+        }
+
+        // Si por alguna razón no vino quantity por variante, al menos el total
         return res.json({
-          text: `${header}${detail}`
+          text: `${header}\n**Stock disponible:** ${qty} ${pluralUnidad(qty)}`
         });
       }
 
-      // Cuando la tienda no expone cantidad exacta, informar disponibilidad por variante
+      // Cuando la tienda no expone cantidad exacta, informar disponibilidad
       const avail = info.variants.filter(v => v.available);
       if (avail.length) {
         const header = `Disponibilidad de **${info.title}**:`;
         const lines = avail.map(v => {
           const name = isDefaultVariantTitle(v.title) ? 'Variante única' : `Variante ${v.title}`;
-          return `- ${name}: **disponible**`;
+          return `- ${name}: disponible`;
         });
-        return res.json({
-          text: `${header}\n${lines.join('\n')}`
-        });
+        return res.json({ text: `${header}\n${lines.join('\n')}` });
       }
 
       return res.json({ text: `Por ahora **${info.title}** no muestra stock disponible.` });
@@ -497,7 +490,6 @@ app.post('/chat', async (req,res)=>{
         const lines = custom.map(b=>[b.title,b.url,b.image||''].join('|')).join('\n');
         return res.json({ text: `BRANDS:\n${lines}` });
       }
-      // generar desde vendors
       const d = await gql(`query{ products(first:120){ edges{ node{ vendor } } } }`);
       const vendors = (d.products?.edges||[]).map(e=>String(e.node.vendor||'').trim()).filter(Boolean);
       const top = Array.from(new Set(vendors)).slice(0,48);
@@ -578,7 +570,6 @@ app.post('/chat', async (req,res)=>{
 
     /* ---- IA para info (paso a paso) + recomendaciones reales desde Shopify ---- */
     if (intent === 'info' || intent === 'browse'){
-      // 1) Mini plan con IA (bloque TIP:)
       let tipText = '';
       try{
         const ai = await openai.chat.completions.create({
@@ -594,7 +585,6 @@ app.post('/chat', async (req,res)=>{
         console.warn('[ai] fallo mini plan', err?.message||err);
       }
 
-      // 2) Recomendaciones (IA → keywords/marcas → Shopify)
       let items = [];
       try{
         const { keywords, brands, max } = await aiProductQuery(message||'');
@@ -605,7 +595,6 @@ app.post('/chat', async (req,res)=>{
         console.warn('[searchByQueries] error', err?.message||err);
       }
 
-      // Fallbacks por reglas y por título si aún está vacío
       if (!items.length){
         const qn = norm(message||'');
         if (/(impermeabiliz|protector).*(sillon|sof[aá]|tapiz)/.test(qn)) {
@@ -640,7 +629,6 @@ app.post('/chat', async (req,res)=>{
       return res.json({ text: finalText });
     }
 
-    // Fallback total
     return res.json({ text: "¿Me cuentas un poco más? Puedo sugerirte productos o calcular envío por región." });
 
   }catch(e){
