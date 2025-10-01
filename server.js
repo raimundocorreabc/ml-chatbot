@@ -1,4 +1,7 @@
-// server.js — IA-first + catálogo/brands/envíos/regiones/shopping-list + IA→keywords→Shopify + STOCK (formato refinado)
+// server.js — IA-first + catálogo/brands/envíos/regiones/shopping-list
+// + IA→keywords→Shopify + STOCK (formato refinado)
+// + (2) XSS/tip-sanitizer server-side, (3) re-ranking por clics,
+// + (5) bloque INFO opcional, (6) robustez de intents y browse con re-ranking.
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
@@ -46,6 +49,18 @@ const FREE_TH_DEFAULT = 40000;
 const norm = s => String(s||'').normalize('NFD').replace(/[\u0300-\u036f]/g,'').toLowerCase();
 const fold = s => norm(s).replace(/ñ/g,'n');
 const fmtCLP = n => new Intl.NumberFormat('es-CL',{style:'currency',currency:'CLP',maximumFractionDigits:0}).format(Math.round(Number(n)||0));
+
+/** Sanitiza tips: sin URLs ni /products/ en el TIP (refuerzo al prompt) */
+function stripDangerousFromTip(text='') {
+  let t = String(text||'');
+  // quita URLs absolutas
+  t = t.replace(/\bhttps?:\/\/\S+/gi, '');
+  // quita paths de productos
+  t = t.replace(/\/products\/[a-z0-9\-_%.]+/gi, '');
+  // colapsa espacios
+  t = t.replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+  return t;
+}
 
 async function gql(query, variables = {}) {
   const url = `https://${SHOPIFY_STORE_DOMAIN}/api/${SF_API_VERSION}/graphql.json`;
@@ -112,6 +127,24 @@ function buildProductsMarkdown(items=[]){
   if (!items.length) return null;
   const lines = items.map((p,i)=>`${i+1}. **[${(p.title||'Ver producto').replace(/\*/g,'')}](${BASE}/products/${p.handle})**`);
   return `Aquí tienes opciones:\n\n${lines.join('\n')}`;
+}
+
+/** Re-ordenar usando señales de clic del cliente (meta.clickScores) */
+function reRankByClickScores(items=[], clickScoresMap = {}) {
+  if (!items.length) return items;
+  const scores = clickScoresMap && typeof clickScoresMap === 'object' ? clickScoresMap : {};
+  // pesos sencillos: clics y disponibilidad
+  const W_CLICK = 1.0;
+  const W_AVAIL = 0.4;
+
+  return [...items]
+    .map(p => {
+      const base = Number(scores[p.handle] || 0);
+      const avail = p.availableForSale ? 1 : 0;
+      return { p, score: base*W_CLICK + avail*W_AVAIL };
+    })
+    .sort((a,b)=> b.score - a.score)
+    .map(x=>x.p);
 }
 
 async function preferInStock(items, need){
@@ -310,9 +343,7 @@ async function searchByQueries(keywords=[], brands=[], max=6){
 }
 
 /* ---------- STOCK helpers/intents (refinados) ---------- */
-// incluye 'stok' (sin c) y otras señales
 const STOCK_REGEX = /\b(stock|stok|disponible|disponibilidad|quedan|hay\s+unidades|inventario)\b/i;
-
 function extractHandleFromText(s=''){
   const m = String(s||'').match(/\/products\/([a-z0-9\-_%.]+)/i);
   return m ? m[1] : null;
@@ -393,11 +424,41 @@ async function fetchStorefrontStockByHandle(handle){
   };
 }
 
+/* ----- (5) Bloques INFO determinísticos (opcionales) ----- */
+function maybeInfoBlock(userText='') {
+  const q = norm(userText);
+  // Seguridad básica con cloro/lejía
+  if (/(cloro|lej[ií]a)/.test(q)) {
+    // No cifras arriesgadas: recomendaciones generales y seguras.
+    const lines = [
+      'INFO:',
+      'Uso seguro de cloro',
+      'No mezclar|Nunca mezcles cloro con amoníaco, vinagre u otros ácidos',
+      'Ventilación|Usa en espacios ventilados y guantes',
+      'Prueba previa|Haz prueba en zona poco visible',
+      'Enjuague|Enjuaga superficies de contacto con alimentos',
+    ];
+    return lines.join('\n');
+  }
+  // Vidrios
+  if (/vidrio|ventana/.test(q)) {
+    return [
+      'INFO:',
+      'Limpieza de vidrios',
+      'Paños|Microfibra sin pelusa',
+      'Orden|De arriba hacia abajo para evitar marcas',
+      'Clima|Evita sol directo para que no seque muy rápido',
+    ].join('\n');
+  }
+  return null;
+}
+
 /* =============== Endpoint =============== */
 app.post('/chat', async (req,res)=>{
   try{
     const { message, toolResult, meta={} } = req.body;
     const FREE_TH = Number(FREE_SHIPPING_THRESHOLD_CLP ?? FREE_TH_DEFAULT);
+    const clickScores = meta?.clickScores || {}; // <- señales de clics del cliente
 
     /* ----------- POST-TOOL HANDLER ----------- */
     if (toolResult?.id) {
@@ -437,7 +498,6 @@ app.post('/chat', async (req,res)=>{
 
         const withQty = info.variants.filter(v => typeof v.quantityAvailable === 'number');
 
-        // Bloque "Stock disponible" (si hay un solo SKU o “Default Title”, queda muy limpio)
         if (withQty.length === 1) {
           const v = withQty[0];
           const label = isDefaultVariantTitle(v.title) ? '**Stock disponible:**' : `**Variante ${v.title} — Stock:**`;
@@ -456,7 +516,6 @@ app.post('/chat', async (req,res)=>{
           });
         }
 
-        // Si por alguna razón no vino quantity por variante, al menos el total
         return res.json({
           text: `${header}\n**Stock disponible:** ${qty} ${pluralUnidad(qty)}`
         });
@@ -478,8 +537,10 @@ app.post('/chat', async (req,res)=>{
 
     /* ---- Más vendidos ---- */
     if (intent === 'tops'){
-      const items = await listTopSellers(10).then(xs=>preferInStock(xs,8));
+      let items = await listTopSellers(10).then(xs=>preferInStock(xs,8));
       if (!items.length) return res.json({ text: "Por ahora no tengo un ranking de más vendidos." });
+      // re-ranking por clics
+      items = reRankByClickScores(items, clickScores);
       return res.json({ text: buildProductsMarkdown(items) });
     }
 
@@ -556,13 +617,16 @@ app.post('/chat', async (req,res)=>{
       const earn = Number(MUNDOPUNTOS_EARN_PER_CLP || 1);
       const redeem100 = Number(MUNDOPUNTOS_REDEEM_PER_100 || 3);
       const url = (MUNDOPUNTOS_PAGE_URL || '').trim();
+      // se mantiene texto directo (simple); si quieres, podría emitirse como INFO más adelante
       return res.json({ text: `**Mundopuntos**: ganas **${earn} punto(s) por $1**. Canje: **100 puntos = ${fmtCLP(redeem100)}**. ${url?`Más info: ${url}`:'Adminístralo en el widget de recompensas.'}` });
     }
 
     /* ---- Shopping list (varios ítems) ---- */
     if (intent === 'shopping'){
-      const picks = await selectProductsByOrderedKeywords(message||'');
+      let picks = await selectProductsByOrderedKeywords(message||'');
       if (picks && picks.length){
+        // re-ranking por clics
+        picks = reRankByClickScores(picks, clickScores);
         return res.json({ text: `Te dejo una opción por ítem:\n\n${buildProductsMarkdown(picks)}` });
       }
       // si no hubo match, caemos a IA+browse
@@ -580,7 +644,7 @@ app.post('/chat', async (req,res)=>{
           ]
         });
         const out = (ai.choices?.[0]?.message?.content || '').trim();
-        if (out) tipText = `TIP: ${out}`;
+        if (out) tipText = `TIP: ${stripDangerousFromTip(out)}`;
       }catch(err){
         console.warn('[ai] fallo mini plan', err?.message||err);
       }
@@ -620,12 +684,21 @@ app.post('/chat', async (req,res)=>{
         }
       }
 
+      // re-ranking por clics
+      if (items.length) items = reRankByClickScores(items, clickScores);
+
       const list = items.length ? `\n\n${buildProductsMarkdown(items)}` : '';
       const greet = (meta?.userFirstName && meta?.tipAlreadyShown!==true && Number(meta?.cartSubtotalCLP||0) < Number(FREE_TH||FREE_TH_DEFAULT))
         ? `TIP: Hola, ${meta.userFirstName} 👋 | Te faltan ${fmtCLP(Number(FREE_TH||FREE_TH_DEFAULT) - Number(meta?.cartSubtotalCLP||0))} para envío gratis en RM\n\n`
         : '';
 
-      const finalText = (tipText ? `${greet}${tipText}${list}` : (list || 'No encontré coincidencias exactas. ¿Me das una pista más (marca, superficie, aroma)?'));
+      // INFO opcional determinístico
+      const infoBlock = maybeInfoBlock(message||'');
+
+      const finalText =
+        (tipText ? `${greet}${tipText}${list}` : (list || 'No encontré coincidencias exactas. ¿Me das una pista más (marca, superficie, aroma)?')) +
+        (infoBlock ? `\n\n${infoBlock}` : '');
+
       return res.json({ text: finalText });
     }
 
@@ -641,4 +714,3 @@ app.post('/chat', async (req,res)=>{
 app.get('/health', (_,res)=>res.json({ ok:true }));
 const port = PORT || process.env.PORT || 3000;
 app.listen(port, ()=>console.log('ML Chat server on :'+port));
-
