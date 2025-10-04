@@ -176,7 +176,7 @@ function splitShopping(text=''){
 async function bestMatchForPhrase(phrase){
   const p = phrase.toLowerCase().trim();
   const syn = SHOPPING_SYNONYMS[p] || [p];
-  const pool=[]; const seen=new Set();
+  let pool=[]; const seen=new Set();
   for (const q of syn){
     const found = await searchProductsPlain(q, 10).catch(()=>[]);
     for (const it of found){ if(!seen.has(it.handle)){ seen.add(it.handle); pool.push(it);} }
@@ -188,6 +188,12 @@ async function bestMatchForPhrase(phrase){
       for (const it of found){ if(!seen.has(it.handle)){ seen.add(it.handle); pool.push(it);} }
     }
   }
+
+  // 🔒 Filtro especial: si el usuario pidió "cocina", evitar BBQ/parrilla/grill
+  if (/cocina/.test(norm(phrase)) && pool.length){
+    pool = pool.filter(p => !/bbq|parrilla|grill/i.test(p.title || ''));
+  }
+
   if (!pool.length) return null;
   return (await preferInStock(pool,1))[0] || pool[0];
 }
@@ -628,7 +634,12 @@ function detectIntent(text=''){
   if (/(que marcas|qué marcas|marcas venden|marcas disponibles)/.test(q)) return 'brands';
   if (/(categorias|categorías|tipos de productos|colecciones|que productos venden|qué productos venden)/.test(q)) return 'categories';
   if (PURPOSE_REGEX.test(text)) return 'info';
-  if (/,/.test(text) || /necesito:|lista:|comprar:|quiero:/.test(q)) return 'shopping';
+
+  // 🧩 Shopping list: NO activar por una sola coma casual.
+  const commaCount = (text.match(/,/g) || []).length;
+  const looksLikeRealList = /\b\w+\b\s*,\s*\b\w+\b\s*(?:,|\by\b)\s*\b\w+\b/i.test(text);
+  if (/(necesito:|lista:|comprar:|quiero:)/.test(q) || commaCount >= 2 || looksLikeRealList) return 'shopping';
+
   return 'browse';
 }
 
@@ -943,3 +954,4 @@ app.post('/chat', async (req,res)=>{
 app.get('/health', (_,res)=>res.json({ ok:true }));
 const port = PORT || process.env.PORT || 3000;
 app.listen(port, ()=>console.log('ML Chat server on :'+port));
+
