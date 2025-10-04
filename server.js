@@ -1,5 +1,6 @@
 // server.js — IA-first + catálogo/brands/envíos/regiones/shopping-list
-// + IA→keywords→Shopify + STOCK (mejorado) + Ranker título→ranking→descripción
+// + IA→keywords→Shopify + STOCK
+// + Ranker reforzado: intención→(boost título exacto)→penalizaciones negativas→descripción
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
@@ -151,25 +152,40 @@ async function preferInStock(items, need){
   return out;
 }
 
-/* ===== Ranker: prioriza título → luego descripción (y disponible primero) ===== */
+/* ===== Ranker: prioriza TÍTULO → penaliza negativos por intención → luego DESCRIPCIÓN ===== */
 const STOP = new Set(['de','del','para','con','en','la','el','los','las','y','o','por','una','un','al','lo']);
 const toks = s => norm(s).replace(/[^a-z0-9\s]/g,' ').split(/\s+/).filter(w=>w && !STOP.has(w));
 const hasPhrase = (haystack, phrase) => norm(haystack).includes(norm(phrase));
 
 function scoreTitle(title, userText){
+  const tNorm = norm(title);
   const tks = new Set(toks(title));
   const qs  = toks(userText);
   let s = 0;
-  // 1) coincidencia de frase completa (muy fuerte)
+  // frase completa
   if (hasPhrase(title, userText)) s += 6;
-  // 2) coincidencias token a token en título
+  // token a token
   for (const q of qs){ if (tks.has(q)) s += 2; }
-  // 3) bonus por palabras “tipo producto” comunes
+  // boosts genéricos útiles
   if (tks.has('limpiador')) s += 1;
-  if (tks.has('alfombra') && /alfombra|tapicer/.test(norm(userText))) s += 2;
-  if (tks.has('quarzo') || tks.has('cuarzo')) if (/quarzo|cuarzo/.test(norm(userText))) s += 2;
+  if (tks.has('alfombra') && /alfombra|tapicer/.test(norm(userText))) s += 4; // ↑↑
+  if ((tks.has('baño') || tks.has('bano') || tks.has('inodoro')) && /(bañ|bano|inodoro|sarro|moho|antihongo)/.test(norm(userText))) s += 4;
+  if ((tks.has('quarzo') || tks.has('cuarzo') || tks.has('granito')) && /(quarzo|cuarzo|granito)/.test(norm(userText))) s += 3;
+
+  // penalizaciones (evitamos “vitrocerámica”/“piso madera” para consultas de alfombra/baño)
+  if (/(alfombra|tapicer)/.test(norm(userText))) {
+    if (/vitroceram/i.test(tNorm)) s -= 6;
+    if (/\bmadera\b|\bparquet\b|\blaminado\b/.test(tNorm)) s -= 4;
+    if (/\bpiso\b/.test(tNorm)) s -= 3;
+  }
+  if (/(bañ|bano|inodoro)/.test(norm(userText))) {
+    if (/vitroceram/i.test(tNorm)) s -= 6;
+    if (/\bmadera\b|\bparquet\b|\blaminado\b/.test(tNorm)) s -= 4;
+    if (/\bpiso\b/.test(tNorm)) s -= 3;
+  }
   return s;
 }
+
 function scoreDesc(desc, userText){
   if (!desc) return 0;
   let s = 0;
@@ -177,29 +193,51 @@ function scoreDesc(desc, userText){
   const q = toks(userText);
   const d = new Set(toks(desc));
   for (const w of q){ if (d.has(w)) s += 0.5; }
+  // ligeras penalizaciones si la descripción habla de superficies equivocadas con intención clara
+  const dn = norm(desc);
+  if (/(alfombra|tapicer)/.test(norm(userText))) {
+    if (/vitroceram/i.test(dn)) s -= 2;
+    if (/\bmadera\b|\bparquet\b|\blaminado\b/.test(dn)) s -= 1.5;
+  }
+  if (/(bañ|bano|inodoro)/.test(norm(userText))) {
+    if (/vitroceram/i.test(dn)) s -= 2;
+    if (/\bmadera\b|\bparquet\b|\blaminado\b/.test(dn)) s -= 1.5;
+  }
   return s;
+}
+
+// “Match duro” por intención: prioriza títulos que contengan los términos clave
+function hardTitleFilterByIntent(userText, pool){
+  const q = norm(userText);
+  let re = null;
+  if (/(alfombra|tapicer)/.test(q)) {
+    re = /(alfombra|tapicer)/i;
+  } else if (/(bañ|bano|inodoro|sarro|moho|antihongo)/.test(q)) {
+    re = /(bañ|bano|inodoro|sarro|moho|antihong)/i;
+  }
+  if (!re) return pool;
+  const strong = pool.filter(p => re.test(p.title||''));
+  // si hay suficientes matches duros, usa eso; si no, mezcla con pool original
+  if (strong.length >= 3) return strong.concat(pool).slice(0, Math.max(12, strong.length));
+  return pool;
 }
 
 async function rankProductsByTitleThenDescription(userText, initialPool){
   if (!initialPool || !initialPool.length) return [];
 
+  // filtro “duro” por intención (si aplica)
+  let pool = hardTitleFilterByIntent(userText, initialPool);
+
   // 1) puntuación por título
-  const withTitleScore = initialPool.map(p => ({
-    ...p,
-    _t: scoreTitle(p.title||'', userText)
-  }));
+  let withTitleScore = pool.map(p => ({ ...p, _t: scoreTitle(p.title||'', userText) }));
+  withTitleScore.sort((a,b)=> b._t - a._t);
+  let shortlist = withTitleScore.slice(0, 16);
 
-  // Si ya hay buenos títulos, cortamos shortlist
-  let shortlist = withTitleScore.sort((a,b)=> b._t - a._t).slice(0, 12);
-
-  // 2) enriquecer con descripción SOLO si los títulos no son claros
-  const needDesc = (shortlist[0]?._t || 0) < 6; // si no hubo frase fuerte
+  // 2) enriquecer con descripción si el top no es contundente
+  const needDesc = (shortlist[0]?._t || 0) < 6;
   if (needDesc){
-    // Traer descripción para la shortlist
     const metas = await Promise.all(shortlist.map(x => fetchProductMetaByHandle(x.handle).catch(()=>null)));
-    const metaMap = new Map();
-    metas.forEach(m => { if (m) metaMap.set(m.handle, m); });
-
+    const metaMap = new Map(); metas.forEach(m => { if (m) metaMap.set(m.handle, m); });
     shortlist = shortlist.map(p => {
       const meta = metaMap.get(p.handle);
       const dScore = meta ? scoreDesc(meta.description||'', userText) : 0;
@@ -251,7 +289,7 @@ const SHOPPING_SYNONYMS = {
   'esponja':   ['esponja','fibra','sponge','scrub daddy'],
   'parrillas': ['limpiador parrilla','bbq','grill','goo gone bbq','desengrasante parrilla'],
   'piso':      ['limpiador pisos','floor cleaner','bona','lithofin'],
-  'alfombra':  ['limpiador alfombra','tapiceria','tapiz','dr beckmann'],
+  'alfombra':  ['limpiador alfombra','shampoo alfombra','tapiceria','tapiz','dr beckmann alfombra','astonish tapicerias'],
   'vidrio':    ['limpia vidrios','glass cleaner','weiman glass'],
   'acero':     ['limpiador acero inoxidable','weiman acero'],
   'protector textil': ['protector textil','impermeabilizante telas','fabric protector']
@@ -325,17 +363,17 @@ async function titleMatchProducts(queryText, max=6){
   return ordered;
 }
 
-/* ====== Expansor semántico de superficies ====== */
+/* ====== Expansor semántico (más específico) ====== */
 function semanticQueryExpansion(text=''){
   const q = norm(text);
   const patterns = [
-    { key: 'alfombra', match: /(alfombra|tapiz|tapicer|moqueta)/, queries: ['limpiador alfombra', 'limpiador tapiceria', 'dr beckmann alfombra', 'astonish tapicerias'] },
-    { key: 'vidrio', match: /(vidrio|ventana|cristal)/, queries: ['limpiavidrios', 'weiman glass', 'limpiador vidrio'] },
-    { key: 'acero', match: /(acero|inox)/, queries: ['weiman acero', 'limpiador acero inoxidable'] },
-    { key: 'cocina', match: /(cocina|encimera|horn|grasa)/, queries: ['desengrasante cocina', 'weiman cocina', 'goo gone grill'] },
-    { key: 'baño', match: /(bañ|inodoro|ducha|lavamanos|ceramic)/, queries: ['limpiador baño', 'antihongos', 'astonish baño'] },
-    { key: 'piedra', match: /(granito|marmol|cuarzo|quarzo|piedra)/, queries: ['weiman granite', 'limpiador piedra', 'limpiador cuarzo'] },
-    { key: 'piso', match: /(piso|madera|laminado|parquet)/, queries: ['limpiador pisos', 'bona piso', 'weiman piso'] },
+    { key: 'alfombra', match: /(alfombra|tapiz|tapicer|moqueta)/, queries: ['limpiador alfombra', 'shampoo alfombra', 'limpiador tapiceria', 'dr beckmann alfombra', 'astonish tapicerias'] },
+    { key: 'baño',     match: /(bañ|bano|inodoro|ducha|lavamanos|azulejo|sarro|moho|antihongo)/, queries: ['limpiador baño', 'antihongos baño', 'gel inodoro', 'desinfectante baño', 'desincrustante sarro'] },
+    { key: 'vidrio',   match: /(vidrio|ventana|cristal)/, queries: ['limpiavidrios', 'weiman glass', 'limpiador vidrio'] },
+    { key: 'acero',    match: /(acero|inox)/, queries: ['weiman acero', 'limpiador acero inoxidable'] },
+    { key: 'cocina',   match: /(cocina|encimera|horn|grasa)/, queries: ['desengrasante cocina', 'weiman cocina', 'goo gone grill'] },
+    { key: 'piedra',   match: /(granito|marmol|cuarzo|quarzo|piedra)/, queries: ['weiman granite', 'limpiador piedra', 'limpiador cuarzo'] },
+    { key: 'piso',     match: /(piso|madera|laminado|parquet)/, queries: ['limpiador pisos', 'bona piso', 'weiman piso'] },
   ];
   for (const p of patterns){
     if (p.match.test(q)) return p.queries;
@@ -410,15 +448,15 @@ async function searchByQueries(keywords=[], brands=[], max=6){
       if (!seen.has(it.handle)){
         seen.add(it.handle);
         pool.push(it);
-        if (pool.length >= max*3) break;
+        if (pool.length >= max*4) break;
       }
     }
-    if (pool.length >= max*3) break;
+    if (pool.length >= max*4) break;
   }
-  return await preferInStock(pool, max);
+  return pool;
 }
 
-/* ---------- STOCK helpers/intents (mejorados) ---------- */
+/* ---------- STOCK helpers/intents ---------- */
 const STOCK_REGEX = /\b(stock|en\s+stock|stok|disponible|disponibilidad|quedan?|hay|tiene[n]?|inventario)\b/i;
 
 function extractHandleFromText(s=''){
@@ -426,7 +464,7 @@ function extractHandleFromText(s=''){
   return m ? m[1] : null;
 }
 
-// ===== Selección de producto para preguntas de stock =====
+/* ===== Selección de producto para preguntas de stock ===== */
 const KNOWN_BRANDS = [
   'astonish','quix','dr beckmann','dr. beckmann','cif','weiman','lithofin',
   'goo gone','scrub daddy','scrub mommy','bona','the good one'
@@ -773,7 +811,7 @@ app.post('/chat', async (req,res)=>{
 
       let items = [];
 
-      // 0) Expansor semántico (si la consulta es “superficie/uso” claro)
+      // 0) Expansor semántico
       const semanticQueries = semanticQueryExpansion(message||'');
       if (semanticQueries){
         const pool=[]; const seen=new Set();
@@ -786,24 +824,26 @@ app.post('/chat', async (req,res)=>{
         }
       }
 
-      // 1) Si aún vacío, usar extractor IA → queries → ranker
+      // 1) IA → queries → ranker
       if (!items.length){
         try{
           const { keywords, brands, max } = await aiProductQuery(message||'');
           if (keywords.length || brands.length){
-            const pool = await searchByQueries(keywords, brands, Math.min(12, Math.max(6, max)));
+            const pool = await searchByQueries(keywords, brands, Math.min(16, Math.max(6, max)));
             if (pool.length){
-              items = await rankProductsByTitleThenDescription(message||'', pool).then(xs=>preferInStock(xs,6));
+              const ranked = await rankProductsByTitleThenDescription(message||'', pool);
+              items = await preferInStock(ranked, 6);
             }
           }
         }catch(err){ console.warn('[searchByQueries] error', err?.message||err); }
       }
 
-      // 2) Fallback clásico: titleMatch (y luego re-ordenar por ranker)
+      // 2) Fallback clásico: search plano → ranker
       if (!items.length){
         const pool = await searchProductsPlain(String(message||'').slice(0,120), 24);
         if (pool.length){
-          items = await rankProductsByTitleThenDescription(message||'', pool).then(xs=>preferInStock(xs,6));
+          const ranked = await rankProductsByTitleThenDescription(message||'', pool);
+          items = await preferInStock(ranked, 6);
         } else {
           items = await titleMatchProducts(message||'', 6);
         }
