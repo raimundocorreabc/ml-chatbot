@@ -1,4 +1,4 @@
-// server.js — IA-first + catálogo/brands/envíos/regiones/shopping-list + STOCK + Recos TITLE-FIRST estrictas (v2)
+// server.js — IA-first + catálogo/brands/envíos/regiones/shopping-list + STOCK + Recos TITLE-FIRST estrictas (v3)
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
@@ -195,7 +195,7 @@ const SHOPPING_SYNONYMS = {
 };
 const tokenize = s => norm(s).replace(/[^a-z0-9\s]/g,' ').split(/\s+/).filter(Boolean);
 
-/* ---------- Recos STRICT TITLE-FIRST + blacklists por superficie ---------- */
+/* ---------- Recos STRICT TITLE-FIRST (con title:) + blacklists ---------- */
 const STOP_ES = new Set([
   'y','o','u','de','del','la','el','los','las','un','una','unos','unas','para','por','en','con','sin','al',
   'tengo','necesito','quiero','me','recomiendas','recomendar','ayuda','como','cómo','limpiar','limpieza','producto','productos',
@@ -224,14 +224,10 @@ const contentTokens = (str='')=> String(str)
   .map(rootize)
   .filter(t => t.length>=3 && !STOP_ES.has(t));
 
-const diacInsensitive = s => s.normalize('NFD').replace(/[\u0300-\u036f]/g,'');
-
-function buildWordRegexes(tokens){
-  // Palabras completas, insensible a acentos y mayúsculas
-  return tokens.map(t=>{
-    const x = diacInsensitive(t).replace(/[.*+?^${}()|[\]\\]/g,'\\$&');
-    return new RegExp(`\\b${x}\\b`, 'i');
-  });
+function jaccard(aSet, bSet){
+  const inter = new Set([...aSet].filter(x=>bSet.has(x))).size;
+  const union = new Set([...aSet, ...bSet]).size || 1;
+  return inter/union;
 }
 
 function pickSurfaceKey(tokens){
@@ -247,96 +243,68 @@ function pickSurfaceKey(tokens){
   return best;
 }
 
-function jaccard(aSet, bSet){
-  const inter = new Set([...aSet].filter(x=>bSet.has(x))).size;
-  const union = new Set([...aSet, ...bSet]).size || 1;
-  return inter/union;
+// Construye query estrita de TÍTULO: title:"alfombra" OR title:"carpet" ...
+function buildTitleQuery(terms=[]){
+  const esc = s => `"${String(s).replace(/"/g,'\\"')}"`;
+  const parts = terms.map(t => `title:${esc(t)}`);
+  // Shopify acepta OR/AND. Usamos OR para ampliar, pero solo campo título.
+  return parts.length ? parts.join(' OR ') : '';
 }
 
-/* —— NUEVO: título primero, estricto, con blacklist — */
-async function titleOnlyRecommend(userText, take=6){
+async function strictTitleSearch(userText, take=6){
   const toks = contentTokens(userText);
   if (!toks.length) return [];
 
-  const surface = pickSurfaceKey(toks); // ej: "baño", "alfombra", etc.
-  const synonyms = surface ? (SHOPPING_SYNONYMS[surface]||[surface]) : [];
-  const titleWhitelist = new Set(
-    [surface, ...synonyms].filter(Boolean).map(rootize)
-  );
+  const surface = pickSurfaceKey(toks); // ej: "alfombra", "baño", etc.
+  const syns = surface ? (SHOPPING_SYNONYMS[surface]||[surface]) : [];
 
-  // consultas: superficie + tokens del usuario + frase completa (capado)
-  const queries = new Set();
-  if (synonyms.length) synonyms.forEach(q=>queries.add(q));
-  toks.slice(0,6).forEach(t=>queries.add(t));
-  queries.add(String(userText).slice(0,120));
+  // Si no detectamos superficie, intentamos con los tokens del usuario directamente, pero siempre en título
+  const titleTerms = (syns.length ? syns : toks).slice(0,12);
 
-  // buscar
-  const poolMap = new Map();
-  for (const q of Array.from(queries).slice(0,14)){
-    const found = await searchProductsDetailed(q, 25).catch(()=>[]);
-    for (const p of found){
-      if (!poolMap.has(p.handle)) poolMap.set(p.handle, p);
-    }
-  }
-  let pool = Array.from(poolMap.values());
-  if (!pool.length) return [];
+  const query = buildTitleQuery(titleTerms);
+  if (!query) return [];
 
-  // construir matchers de título
-  const titleTokens = [...titleWhitelist].size ? [...titleWhitelist] : toks;
-  const titleMatchers = buildWordRegexes(titleTokens);
-  const userMatchers  = buildWordRegexes(toks);
+  // Buscamos por TÍTULO únicamente
+  const raw = await searchProductsDetailed(query, 50).catch(()=>[]);
+  if (!raw.length) return [];
 
-  // aplicar blacklist por superficie
+  // Blacklist por superficie (para cortar vitro/piso, etc.)
   const bl = new Set((SURFACE_BLACKLIST[surface]||[]).map(rootize));
-  const isBlack = t => bl.has(rootize(t));
 
-  const pass = (p)=>{
-    const title = diacInsensitive(p.title||'');
-    const ntitle = norm(p.title||'');
-    // 1) evitar falsos positivos por blacklist
-    for (const b of bl){
-      if (new RegExp(`\\b${b}\\b`, 'i').test(title)) return false;
-    }
-    // 2) exigir match en TÍTULO (si hay superficie/whitelist)
-    const titleHit = titleMatchers.length ? titleMatchers.some(rx=>rx.test(title)) : userMatchers.some(rx=>rx.test(title));
-    if (!titleHit) return false;
+  const pass = raw.filter(p=>{
+    const t = contentTokens(p.title||'');
+    for (const b of bl){ if (t.has?.(b) || new Set(t).has(b)) return false; }
+    // asegurarnos al menos 1 palabra whitelisted/sinónimo en el título
+    const tset = new Set(t);
+    const wl = syns.length ? syns.map(rootize) : toks;
+    const hit = wl.some(w=>tset.has(rootize(w)));
+    return hit;
+  });
 
-    // 3) score
+  if (!pass.length) return [];
+
+  // Scoring: disponible > matches en título > similitud con userText > (ligero) desc
+  const userSet = new Set(toks);
+  const scored = pass.map(p=>{
     const titleSet = new Set(contentTokens(p.title||''));
     const descSet  = new Set(contentTokens(p.description||''));
-    const userSet  = new Set(toks);
-
-    const whitelistHits = [...titleWhitelist].reduce((n,w)=> n + (titleSet.has(w)?1:0), 0);
-    const userTitleHits = [...userSet].reduce((n,t)=> n + (titleSet.has(t)?1:0), 0);
-
+    const wlHits   = (syns.length ? syns : toks).reduce((n,w)=> n + (titleSet.has(rootize(w))?1:0), 0);
     const score =
       (p.availableForSale ? 2.0 : 0) +
-      whitelistHits * 1.6 +
-      userTitleHits * 0.9 +
-      jaccard(userSet, titleSet) * 0.6 +
-      jaccard(userSet, descSet)  * 0.1;
+      wlHits * 1.2 +
+      jaccard(userSet, titleSet) * 0.7 +
+      jaccard(userSet, descSet)  * 0.2;
+    return { ...p, _score: score, _wl: wlHits };
+  });
 
-    return { ...p, _score: score, _whitelistHits: whitelistHits, _userTitleHits: userTitleHits, _ntitle: ntitle };
-  };
-
-  let scored = [];
-  for (const p of pool){
-    const s = pass(p);
-    if (s) scored.push(s);
-  }
-
-  // si nada pasó, devolvemos vacío (que activará otros fallbacks)
-  if (!scored.length) return [];
-
-  // ordenar: disponible > whitelistHits > score
   scored.sort((a,b)=>{
     if (a.availableForSale !== b.availableForSale) return a.availableForSale ? -1 : 1;
-    if (a._whitelistHits !== b._whitelistHits) return b._whitelistHits - a._whitelistHits;
+    if (a._wl !== b._wl) return b._wl - a._wl;
     return b._score - a._score;
   });
 
-  const trimmed = scored.slice(0, take);
-  return await preferInStock(trimmed, take);
+  const top = scored.slice(0, take);
+  return await preferInStock(top, take);
 }
 
 /* ---------- Recos “like shopping” (fallback) ---------- */
@@ -419,7 +387,7 @@ async function bestMatchForPhrase(phrase){
   const syn = SHOPPING_SYNONYMS[p] || [p];
   const pool=[]; const seen=new Set();
   for (const q of syn){
-    const found = await searchProductsPlain(q, 10).catch(()=>[]);
+    const found = await searchProductsPlain(q, 10).catch(()=>[]); // rápido
     for (const it of found){ if(!seen.has(it.handle)){ seen.add(it.handle); pool.push(it);} }
   }
   if (!pool.length) {
@@ -792,7 +760,7 @@ app.post('/chat', async (req,res)=>{
       return res.json({ text: buildProductsMarkdown(items) });
     }
 
-    /* ---- Marcas (BRANDS chips) ---- */
+    /* ---- Marcas ---- */
     if (intent === 'brands'){
       const custom = parseBrandCarouselConfig();
       if (custom.length){
@@ -809,7 +777,7 @@ app.post('/chat', async (req,res)=>{
       return res.json({ text: 'Trabajamos varias marcas internacionales y locales. ¿Cuál te interesa?' });
     }
 
-    /* ---- Categorías (CATS chips) ---- */
+    /* ---- Categorías ---- */
     if (intent === 'categories'){
       const cols = await listCollections(12);
       if (cols.length){
@@ -828,7 +796,7 @@ app.post('/chat', async (req,res)=>{
       return res.json({ text: `CATS:\n${payload}` });
     }
 
-    /* ---- Envíos (general con carrusel REGIONS) ---- */
+    /* ---- Envíos (general con REGIONS) ---- */
     if (intent === 'shipping'){
       const header = FREE_TH>0 ? `En **RM** hay **envío gratis** sobre **${fmtCLP(FREE_TH)}**.` : `Hacemos despacho a **todo Chile**.`;
       const general = `El costo se calcula en el **checkout** según **región y comuna**. Elige tu región para ver el costo referencial:`;
@@ -842,7 +810,7 @@ app.post('/chat', async (req,res)=>{
       return res.json({ text: `${header}\n${general}\n\nREGIONS:\n${regions}\n\n${tarifas}` });
     }
 
-    /* ---- Envíos (cuando escribe la región/comuna) ---- */
+    /* ---- Envíos (región/comuna) ---- */
     if (intent === 'shipping_region'){
       const q = String(message||'').trim();
       if (REGIONES_F.has(fold(q)) || /^env[ií]o\s+/i.test(q)) {
@@ -877,7 +845,7 @@ app.post('/chat', async (req,res)=>{
       // fallback a browse
     }
 
-    /* ---- Recomendación normal (info/browse) — TÍTULO PRIMERO con blacklist ---- */
+    /* ---- Recomendación normal (info/browse) — TÍTULO PRIMERO con title: ---- */
     if (intent === 'info' || intent === 'browse'){
       let tipText = '';
       try{
@@ -895,7 +863,7 @@ app.post('/chat', async (req,res)=>{
       }
 
       let items = [];
-      try{ items = await titleOnlyRecommend(message||'', 6); }catch(e){ console.warn('[titleOnlyRecommend] error', e?.message||e); }
+      try{ items = await strictTitleSearch(message||'', 6); }catch(e){ console.warn('[strictTitleSearch] error', e?.message||e); }
 
       if (!items.length){
         try{ items = await recommendLikeShopping(message||'', 6); }catch(e){ console.warn('[recommendLikeShopping] error', e?.message||e); }
@@ -941,4 +909,3 @@ app.listen(port, ()=>console.log('ML Chat server on :'+port));
 function pluralUnidad(n){ return (Number(n) === 1) ? 'unidad' : 'unidades'; }
 function pluralDisponible(n){ return (Number(n) === 1) ? 'disponible' : 'disponibles'; }
 function isDefaultVariantTitle(t=''){ return /default\s*title/i.test(String(t)); }
-
