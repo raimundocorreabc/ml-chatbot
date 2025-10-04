@@ -1,4 +1,4 @@
-// server.js — IA-first + catálogo/brands/envíos/regiones/shopping-list + IA→keywords→Shopify + STOCK (mejorado)
+// server.js — IA-first + catálogo/brands/envíos/regiones/shopping-list + IA→keywords→Shopify + STOCK (mejorado + ranker)
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
@@ -68,15 +68,30 @@ async function listCollections(limit = 10){
   return (d.collections?.edges||[]).map(e=>({ title:e.node.title, handle:e.node.handle }));
 }
 
+/* === MOD: incluye description para rankear mejor === */
 async function searchProductsPlain(query, first = 5){
   const d = await gql(`
     query($q:String!,$n:Int!){
       search(query:$q, types: PRODUCT, first:$n){
-        edges{ node{ ... on Product { title handle availableForSale } } }
+        edges{
+          node{
+            ... on Product {
+              title
+              handle
+              availableForSale
+              description
+            }
+          }
+        }
       }
     }
   `,{ q: query, n: first });
-  return (d.search?.edges||[]).map(e=>({ title:e.node.title, handle:e.node.handle, availableForSale: !!e.node.availableForSale }));
+  return (d.search?.edges||[]).map(e=>({
+    title: e.node.title,
+    handle: e.node.handle,
+    availableForSale: !!e.node.availableForSale,
+    description: e.node.description || ''
+  }));
 }
 
 async function listTopSellers(first = 8){
@@ -127,6 +142,73 @@ async function preferInStock(items, need){
   return out;
 }
 
+/* ===== Relevancia por consulta (título > descripción) ===== */
+function strongTokens(s=''){
+  return String(s||'')
+    .normalize('NFD').replace(/[\u0300-\u036f]/g,'')
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g,' ')
+    .split(/\s+/)
+    .filter(w => w && w.length >= 3);
+}
+function uniq(arr){ return Array.from(new Set(arr)); }
+
+function matchScore(product, queryText){
+  const q = uniq(strongTokens(queryText));
+  if (!q.length) return 0;
+
+  const titleTokens = new Set(strongTokens(product.title));
+  const descTokens  = new Set(strongTokens(product.description || ''));
+
+  const allInTitle = q.every(t => titleTokens.has(t));
+  const titleHits = q.reduce((n,t)=> n + (titleTokens.has(t) ? 1 : 0), 0);
+  const descHits  = q.reduce((n,t)=> n + (descTokens.has(t)  ? 1 : 0), 0);
+
+  let score = 0;
+  if (allInTitle) score += 100;  // match fuerte en título
+  score += titleHits * 6;
+  score += descHits  * 1.5;
+
+  if (product.availableForSale) score += 3;
+
+  return score;
+}
+
+function smartRankProducts(queryText, pool, max=6){
+  if (!Array.isArray(pool) || !pool.length) return [];
+  const q = uniq(strongTokens(queryText));
+
+  const hasAllInTitle = p => q.every(t => strongTokens(p.title).includes(t));
+
+  const strictTitle = pool.filter(hasAllInTitle)
+    .sort((a,b)=> matchScore(b,queryText) - matchScore(a,queryText));
+
+  const partialTitle = pool.filter(p =>
+    !strictTitle.includes(p) &&
+    q.some(t => strongTokens(p.title).includes(t))
+  ).sort((a,b)=> matchScore(b,queryText) - matchScore(a,queryText));
+
+  const byDesc = pool.filter(p =>
+    !strictTitle.includes(p) &&
+    !partialTitle.includes(p) &&
+    q.some(t => strongTokens(p.description||'').includes(t))
+  ).sort((a,b)=> matchScore(b,queryText) - matchScore(a,queryText));
+
+  const merged = [...strictTitle, ...partialTitle, ...byDesc];
+
+  const seen = new Set();
+  const out = [];
+  for (const p of merged){
+    if (seen.has(p.handle)) continue;
+    seen.add(p.handle);
+    out.push(p);
+    if (out.length >= max) break;
+  }
+
+  out.sort((a,b) => (b.availableForSale?1:0) - (a.availableForSale?1:0));
+  return out;
+}
+
 /* ----- Shipping regiones/comunas + zonas ----- */
 const REGIONES_LIST = [
   'Arica y Parinacota','Tarapacá','Antofagasta','Atacama',
@@ -148,8 +230,8 @@ const REGION_COST_MAP = (()=>{ const m=new Map(); for(const z of SHIPPING_ZONES)
 const shippingByRegionName = (s='') => REGION_COST_MAP.get(fold(s)) || null;
 
 function regionsPayloadLines(){
-  const uniq = Array.from(new Set(REGIONES_LIST.map(r=>r.replace(/\"/g,''))));
-  return uniq.map(r => `${r}|${r}`).join('\n');
+  const uniqR = Array.from(new Set(REGIONES_LIST.map(r=>r.replace(/\"/g,''))));
+  return uniqR.map(r => `${r}|${r}`).join('\n');
 }
 
 /* ----- Shopping list (1 por ítem, mismo orden) ----- */
@@ -173,6 +255,7 @@ function splitShopping(text=''){
   return base.split(/,|\by\b/gi).map(s=>s.trim()).filter(Boolean);
 }
 
+/* === MOD: usa ranker para elegir el mejor match por ítem === */
 async function bestMatchForPhrase(phrase){
   const p = phrase.toLowerCase().trim();
   const syn = SHOPPING_SYNONYMS[p] || [p];
@@ -189,7 +272,8 @@ async function bestMatchForPhrase(phrase){
     }
   }
   if (!pool.length) return null;
-  return (await preferInStock(pool,1))[0] || pool[0];
+  const ranked = smartRankProducts(phrase, pool, 1);
+  return ranked[0] || pool[0];
 }
 
 async function selectProductsByOrderedKeywords(message){
@@ -217,21 +301,12 @@ function extractKeywords(text='', max=8){
   }
   return bag;
 }
+
+/* === MOD: delega el orden al ranker === */
 async function titleMatchProducts(queryText, max=6){
-  const pool = await searchProductsPlain(String(queryText||'').slice(0,120), 24);
+  const pool = await searchProductsPlain(String(queryText||'').slice(0,120), 50).catch(()=>[]);
   if (!pool.length) return [];
-  const kws = extractKeywords(queryText, 10);
-  if (!kws.length) return (await preferInStock(pool, max)).slice(0,max);
-  const fld = s => norm(s);
-  const scored = pool.map(p => {
-    const t = fld(p.title);
-    const hits = kws.reduce((n,kw)=> n + (t.includes(kw) ? 1 : 0), 0);
-    return { ...p, _hits: hits };
-  });
-  const byHits = scored.sort((a,b)=> b._hits - a._hits).filter(x=>x._hits>0);
-  const shortlist = byHits.length ? byHits.slice(0, max*2) : pool.slice(0, max*2);
-  const ordered = await preferInStock(shortlist, max);
-  return ordered;
+  return smartRankProducts(queryText, pool, max);
 }
 
 /* ----- IA (TIP sin CTA) ----- */
@@ -278,7 +353,7 @@ async function aiProductQuery(userText){
   }
 }
 
-// Ejecuta varias consultas a Shopify combinando keywords y (si hay) marca
+/* === MOD: aplicar ranker al consolidado de queries === */
 async function searchByQueries(keywords=[], brands=[], max=6){
   const pool=[]; const seen=new Set();
 
@@ -301,12 +376,12 @@ async function searchByQueries(keywords=[], brands=[], max=6){
       if (!seen.has(it.handle)){
         seen.add(it.handle);
         pool.push(it);
-        if (pool.length >= max*3) break;
+        if (pool.length >= max*4) break;
       }
     }
-    if (pool.length >= max*3) break;
+    if (pool.length >= max*4) break;
   }
-  return await preferInStock(pool, max);
+  return smartRankProducts(keywords.join(' ') || brands.join(' ') || '', pool, max);
 }
 
 /* ---------- STOCK helpers/intents (mejorados) ---------- */
@@ -347,18 +422,14 @@ function scoreTitleForStock(title='', tokens=[], brandTokens=[]){
   const set = new Set(t);
   let score = 0;
 
-  // Peso a tokens generales
   for (const tok of tokens){
     if (set.has(tok)) score += 1;
   }
-  // Marcas valen más (si todas las palabras de la marca están presentes)
   for (const b of brandTokens){
     const parts = b.split(' ');
     if (parts.every(p => set.has(p))) score += 2;
   }
-  // Bonus por “pasta” si el usuario lo pidió
   if (tokens.includes('pasta') && set.has('pasta')) score += 1;
-  // Bonus por “multiuso(s)”
   if (tokens.includes('multiuso') || tokens.includes('multiusos')){
     if (set.has('multiuso') || set.has('multiusos')) score += 1;
   }
@@ -384,7 +455,6 @@ async function findHandleForStock(message='', meta={}){
   }
   if (tokens.length) queries.push(tokens.join(' '));
 
-  // si viene desde PDP, úsala
   if (meta?.page?.url && /\/products\//i.test(meta.page.url)) {
     const m = meta.page.url.match(/\/products\/([a-z0-9\-_%.]+)/i);
     if (m && m[1]) return m[1];
@@ -409,14 +479,10 @@ async function findHandleForStock(message='', meta={}){
     _score: scoreTitleForStock(p.title, tokens, brandTokens),
   }));
 
-  // calidad mínima
   const good = scored.filter(x => x._score >= 2);
-
-  // si pidió “pasta”, exigirla
   const requirePasta = tokens.includes('pasta');
   const candidateList = (requirePasta ? good.filter(x => /pasta/i.test(x.title)) : good);
 
-  // orden final: disponible primero y mayor score
   const list = (candidateList.length ? candidateList : scored)
     .sort((a,b)=>{
       if (a.availableForSale !== b.availableForSale){
@@ -522,14 +588,14 @@ app.post('/chat', async (req,res)=>{
         handle = extractHandleFromText(meta.page.url);
       }
 
-      // NUEVO: mejor selección por texto si aún no tenemos handle
+      // Mejor selección por texto si aún no tenemos handle
       if (!handle) {
         try {
           handle = await findHandleForStock(message || '', meta);
         } catch {}
       }
 
-      // fallback final por si todo falla
+      // fallback final
       if (!handle) {
         try {
           const found = await titleMatchProducts(message || '', 1);
@@ -568,7 +634,7 @@ app.post('/chat', async (req,res)=>{
           return res.json({
             text: `${header}\n**Detalle por variante:**\n${lines.join('\n')}`
           });
-      }
+        }
 
         return res.json({
           text: `${header}\n**Stock disponible:** ${qty} ${pluralUnidad(qty)}`
@@ -754,3 +820,4 @@ app.post('/chat', async (req,res)=>{
 app.get('/health', (_,res)=>res.json({ ok:true }));
 const port = PORT || process.env.PORT || 3000;
 app.listen(port, ()=>console.log('ML Chat server on :'+port));
+
