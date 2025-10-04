@@ -1,4 +1,4 @@
-// server.js — IA-first + catálogo/brands/envíos/regiones/shopping-list + STOCK + Recos tipo shopping (title-first por superficie)
+// server.js — IA-first + catálogo/brands/envíos/regiones/shopping-list + STOCK + Recos TITLE-FIRST estrictas
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
@@ -68,7 +68,6 @@ async function listCollections(limit = 10){
   return (d.collections?.edges||[]).map(e=>({ title:e.node.title, handle:e.node.handle }));
 }
 
-// Búsqueda con descripción (para rankear mejor por título y usar desc. solo si falta)
 async function searchProductsDetailed(query, first = 25){
   const d = await gql(`
     query($q:String!,$n:Int!){
@@ -178,29 +177,29 @@ function regionsPayloadLines(){
   return uniq.map(r => `${r}|${r}`).join('\n');
 }
 
-/* ----- Shopping list (1 por ítem, mismo orden) ----- */
+/* ======== Shopping list (1 por ítem) ======== */
 const SHOPPING_SYNONYMS = {
   'lavalozas': ['lavalozas','lava loza','lavaplatos','dishwashing','lavavajillas liquido','dawn','quix'],
   'antigrasa': ['antigrasa','desengrasante','degreaser','kh-7','kh7'],
   'multiuso':  ['multiuso','all purpose','limpiador multiuso','cif crema','pink stuff'],
   'esponja':   ['esponja','fibra','sponge','scrub daddy'],
   'parrillas': ['limpiador parrilla','bbq','grill','goo gone bbq','desengrasante parrilla'],
-  'piso':      ['limpiador pisos','floor cleaner','bona','lithofin'],
-  'alfombra':  ['limpiador alfombra','alfombra','tapiceria','tapiz','carpet','carpets','dr beckmann','astonish'],
-  'vidrio':    ['limpia vidrios','glass cleaner','weiman glass','vidrio'],
-  'acero':     ['limpiador acero inoxidable','weiman acero','inoxidable'],
+  'piso':      ['piso','pisos','floor cleaner','bona','lithofin'],
+  'alfombra':  ['alfombra','alfombras','limpiador alfombra','tapiceria','tapiz','carpet','carpets','dr beckmann','astonish'],
+  'vidrio':    ['vidrio','vidrios','limpia vidrios','glass cleaner','weiman glass'],
+  'acero':     ['acero','inoxidable','limpiador acero inoxidable','weiman acero'],
   'protector textil': ['protector textil','impermeabilizante telas','fabric protector','tela','tapiz'],
-  'baño':      ['baño','antihongos','antimoho','sarro','cal','inodoro','wc','sanitario','ducha','azulejo','griferia'],
-  'sofa':      ['sofá','sofa','sillon','tapiz','textil','upholstery','tapiceria'],
+  'baño':      ['baño','baño','bano','antihongos','antimoho','sarro','cal','inodoro','wc','sanitario','ducha','azulejo','azulejos','griferia','grifería'],
+  'sofa':      ['sofá','sofa','sillon','sillón','tapiz','textil','upholstery','tapiceria'],
   'refrigerador': ['refrigerador','refri','nevera','frigorifico','acero inoxidable','desinfectante']
 };
 const tokenize = s => norm(s).replace(/[^a-z0-9\s]/g,' ').split(/\s+/).filter(Boolean);
 
-/* ---------- NUEVO: Recomendador “como shopping” para una sola intención ---------- */
+/* ---------- NUEVO: Recos “title-first” estrictas ---------- */
 const STOP_ES = new Set([
   'y','o','u','de','del','la','el','los','las','un','una','unos','unas','para','por','en','con','sin','al',
   'tengo','necesito','quiero','me','recomiendas','recomendar','ayuda','como','cómo','limpiar','limpieza','producto','productos',
-  'que','qué','cual','cuál','sobre','mas','más','tipo','tipos','usar','uso','mi','mi','el','la','un','una'
+  'que','qué','cual','cuál','sobre','mas','más','tipo','tipos','usar','uso','mi','el','la','un','una'
 ]);
 const rootize = (t='')=>{
   let x = t.normalize('NFD').replace(/[\u0300-\u036f]/g,'').toLowerCase();
@@ -218,21 +217,14 @@ const contentTokens = (str='')=> String(str)
   .filter(t => t.length>=3 && !STOP_ES.has(t));
 
 function pickSurfaceKey(tokens){
-  // decide una “superficie/uso” base comparando con las claves de SHOPPING_SYNONYMS
   const keys = Object.keys(SHOPPING_SYNONYMS);
   const tset = new Set(tokens);
-  // mapeos simples: alfombra, baño, sofa, vidrio, piso, acero, refrigerador…
-  const alias = new Map([['bano','baño'],['banos','baño'],['sofa','sofa'],['sofas','sofa']]);
   let best = null, bestHits = 0;
   for (const k of keys){
-    const variants = [k, ...(SHOPPING_SYNONYMS[k]||[])].map(x=>rootize(x));
+    const variants = [k, ...(SHOPPING_SYNONYMS[k]||[])].map(rootize);
     const vset = new Set(variants);
     const hits = [...tset].reduce((n,t)=> n + (vset.has(t)?1:0), 0);
     if (hits > bestHits){ best=k; bestHits=hits; }
-  }
-  if (!best){
-    // alias directo si coincide exacto con token
-    for (const t of tset){ if (alias.has(t)) return alias.get(t); }
   }
   return best; // puede ser null
 }
@@ -247,20 +239,26 @@ async function recommendLikeShopping(userText, take=6){
   const toks = contentTokens(userText);
   if (!toks.length) return [];
 
-  const surface = pickSurfaceKey(toks); // ej: "alfombra", "baño", "sofa", "refrigerador"
-  const queries = new Set();
+  const surface = pickSurfaceKey(toks); // ej: "alfombra", "baño", "sofa", etc.
 
-  // 1) si detectamos superficie, usar sinónimos de esa superficie (como shopping)
+  // --- construir whitelist (raíces) para exigir en TÍTULO ---
+  const surfaceWhitelist = new Set(
+    (surface ? (SHOPPING_SYNONYMS[surface]||[surface]) : [])
+      .map(s => s.split(/\s+/)).flat()
+      .map(rootize)
+      .filter(x => x && x.length>=3)
+  );
+
+  // consultas (como shopping)
+  const queries = new Set();
   if (surface && SHOPPING_SYNONYMS[surface]){
     for (const q of SHOPPING_SYNONYMS[surface]) queries.add(q);
     queries.add(surface);
   }
-
-  // 2) además, formar consultas simples con tokens del usuario (top 3–5)
   toks.slice(0,5).forEach(t => queries.add(t));
   queries.add(String(userText).slice(0,120));
 
-  // Traer pool (title+desc)
+  // Pool con título+desc
   const poolMap = new Map();
   for (const q of Array.from(queries).slice(0,14)){
     const found = await searchProductsDetailed(q, 25).catch(()=>[]);
@@ -271,54 +269,59 @@ async function recommendLikeShopping(userText, take=6){
   const pool = Array.from(poolMap.values());
   if (!pool.length) return [];
 
-  // Rankeador “título primero”
   const userSet = new Set(toks);
-  const surfaceRoots = new Set((SHOPPING_SYNONYMS[surface]||[surface||'']).map(rootize).filter(Boolean));
 
   const scoreItem = (p)=>{
     const titleToks = new Set(contentTokens(p.title||''));
     const descToks  = new Set(contentTokens(p.description||''));
-    const titleHits = [...userSet].reduce((n,t)=> n + (titleToks.has(t)?1:0), 0);
-    const hasSurfaceInTitle = surface ? [...surfaceRoots].some(s=> titleToks.has(s)) : false;
 
-    // Regla dura: si detectamos superficie, exigir al menos 1 token de esa superficie en el título
-    const passHard = surface ? hasSurfaceInTitle : (titleHits >= 1);
+    // matches estrictos contra WHITELIST de superficie, SOLO TÍTULO
+    const whitelistMatches = [...surfaceWhitelist].reduce((n,w)=> n + (titleToks.has(w)?1:0), 0);
+
+    // si no hay superficie, pedimos al menos 1 token del usuario en título
+    const userTitleHits = [...userSet].reduce((n,t)=> n + (titleToks.has(t)?1:0), 0);
+
+    const passHard = surface ? (whitelistMatches >= 1) : (userTitleHits >= 1);
 
     const score =
       (p.availableForSale ? 2.0 : 0) +
-      (hasSurfaceInTitle ? 2.0 : 0) +
-      titleHits * 1.2 +
-      jaccard(userSet, titleToks) * 0.8 +
-      jaccard(userSet, descToks) * 0.2;
+      whitelistMatches * 1.5 +
+      userTitleHits * 0.8 +
+      jaccard(userSet, titleToks) * 0.6 +
+      jaccard(userSet, descToks) * 0.1;
 
-    return { ...p, _score: score, _passHard: passHard, _titleHits: titleHits };
+    return { ...p, _score: score, _passHard: passHard, _whitelist: whitelistMatches, _titleHits: userTitleHits };
   };
 
   let scored = pool.map(scoreItem);
 
-  // Filtro duro primero
+  // 1) FILTRO DURO: título debe contener al menos 1 token de la superficie (si hay superficie)
   let kept = scored.filter(x=>x._passHard);
 
-  // Si quedó corto, aflojar: permitir título con ≥1 token y buena similitud
+  // 2) ordenar: disponible > matches de whitelist (título) > score global
+  kept.sort((a,b)=>{
+    if (a.availableForSale !== b.availableForSale) return a.availableForSale ? -1 : 1;
+    if (a._whitelist !== b._whitelist) return b._whitelist - a._whitelist;
+    return b._score - a._score;
+  });
+
+  // 3) si aun así quedan pocos, aflojamos ligeramente (permitimos userTitleHits≥1)
   if (kept.length < take){
     const soft = scored
       .filter(x=>!x._passHard && x._titleHits>=1)
-      .sort((a,b)=> b._score - a._score)
+      .sort((a,b)=>{
+        if (a.availableForSale !== b.availableForSale) return a.availableForSale ? -1 : 1;
+        return b._score - a._score;
+      })
       .slice(0, take*2);
     kept = [...kept, ...soft];
   }
-
-  // Orden: disponible > score
-  kept.sort((a,b)=>{
-    if (a.availableForSale !== b.availableForSale) return a.availableForSale ? -1 : 1;
-    return b._score - a._score;
-  });
 
   const trimmed = kept.slice(0, take);
   return await preferInStock(trimmed, take);
 }
 
-/* ----- Shopping list (varios ítems) ----- */
+/* ======== Shopping list (multi-ítem) ======== */
 function splitShopping(text=''){
   const afterColon = text.split(':');
   const base = afterColon.length > 1 ? afterColon.slice(1).join(':') : text;
@@ -464,7 +467,6 @@ function extractHandleFromText(s=''){
   return m ? m[1] : null;
 }
 
-// Marcas (solo sesgo para stock)
 const KNOWN_BRANDS = [
   'astonish','quix','dr beckmann','dr. beckmann','cif','weiman','lithofin',
   'goo gone','scrub daddy','scrub mommy','bona','the good one'
@@ -555,11 +557,6 @@ async function findHandleForStock(message='', meta={}){
 
   return list[0]?.handle || null;
 }
-
-// Formatos
-function pluralUnidad(n){ return (Number(n) === 1) ? 'unidad' : 'unidades'; }
-function pluralDisponible(n){ return (Number(n) === 1) ? 'disponible' : 'disponibles'; }
-function isDefaultVariantTitle(t=''){ return /default\s*title/i.test(String(t)); }
 
 /* ----- Intents ----- */
 const PURPOSE_REGEX = /\b(para que sirve|para qué sirve|que es|qué es|como usar|cómo usar|modo de uso|instrucciones|paso a paso|como limpiar|cómo limpiar|consejos|tips|guia|guía|pasos)\b/i;
@@ -741,8 +738,8 @@ app.post('/chat', async (req,res)=>{
         ['BAÑO',            `${BASE}/search?q=ba%C3%B1o`],
         ['PISOS',           `${BASE}/search?q=pisos`],
       ];
-      const payload = fallback.map(([t,u])=>`${t}|${u}`).join('\n');
-      return res.json({ text: `CATS:\n${payload}` });
+        const payload = fallback.map(([t,u])=>`${t}|${u}`).join('\n');
+        return res.json({ text: `CATS:\n${payload}` });
     }
 
     /* ---- Envíos (general con carrusel REGIONS) ---- */
@@ -785,16 +782,16 @@ app.post('/chat', async (req,res)=>{
       return res.json({ text: `**Mundopuntos**: ganas **${earn} punto(s) por $1**. Canje: **100 puntos = ${fmtCLP(redeem100)}**. ${url?`Más info: ${url}`:'Adminístralo en el widget de recompensas.'}` });
     }
 
-    /* ---- Shopping list (multi-ítem) ---- */
+    /* ---- Shopping list ---- */
     if (intent === 'shopping'){
       const picks = await selectProductsByOrderedKeywords(message||'');
       if (picks && picks.length){
         return res.json({ text: `Te dejo una opción por ítem:\n\n${buildProductsMarkdown(picks)}` });
       }
-      // si no hubo match, caemos a browse normal
+      // fallback a browse
     }
 
-    /* ---- Info/Browse con prioridad “como shopping” ---- */
+    /* ---- Info/Browse con prioridad TITLE-FIRST ---- */
     if (intent === 'info' || intent === 'browse'){
       let tipText = '';
       try{
@@ -811,18 +808,15 @@ app.post('/chat', async (req,res)=>{
         console.warn('[ai] fallo mini plan', err?.message||err);
       }
 
-      // 1) NUEVO: usar la misma filosofía del shopping (superficie → sinónimos → título)
       let items = [];
       try{
         items = await recommendLikeShopping(message||'', 6);
       }catch(e){ console.warn('[recommendLikeShopping] error', e?.message||e); }
 
-      // 2) Fallback: título simple
       if (!items.length){
         try{ items = await titleMatchProducts(message||'', 6); }catch{}
       }
 
-      // 3) Fallback: AI keywords
       if (!items.length){
         try{
           const { keywords, brands, max } = await aiProductQuery(message||'');
@@ -854,4 +848,3 @@ app.post('/chat', async (req,res)=>{
 app.get('/health', (_,res)=>res.json({ ok:true }));
 const port = PORT || process.env.PORT || 3000;
 app.listen(port, ()=>console.log('ML Chat server on :'+port));
-
