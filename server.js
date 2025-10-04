@@ -193,7 +193,7 @@ async function bestMatchForPhrase(phrase){
 }
 
 async function selectProductsByOrderedKeywords(message){
-  const parts = splitShopping(message);
+  const parts = splitShopping(message||'');
   if (parts.length < 2) return null;
   const picks=[]; const used=new Set();
   for (const seg of parts){
@@ -206,7 +206,8 @@ async function selectProductsByOrderedKeywords(message){
 /* ----- Búsqueda precisa por título (fallback) ----- */
 function extractKeywords(text='', max=8){
   const tokens = tokenize(text).filter(t => t.length>=3);
-  const stop = new Set(['tienen','venden','quiero','necesito','precio','productos','producto','limpieza','limpiar','ayuda','me','puedes','recomendar','stock','stok','disponible','disponibilidad','quedan','inventario','cuanto','cuánta','cuánta','baño','bano','limpio','mucho','poco']);
+  // IMPORTANTE: NO filtramos "baño/bano"
+  const stop = new Set(['tienen','venden','quiero','necesito','precio','productos','producto','limpieza','limpiar','ayuda','me','puedes','recomendar','stock','stok','disponible','disponibilidad','quedan','inventario','cuanto','cuánta','cuanta','limpio','mucho','poco']);
   const bag=[]; const seen=new Set();
   for (const t of tokens){
     if (stop.has(t)) continue;
@@ -238,30 +239,103 @@ async function titleMatchProducts(queryText, max=6){
   return ordered;
 }
 
-/* ===== Nueva lógica de recomendación: priorizar TÍTULO ===== */
-const STOPWORDS = new Set(['la','el','los','las','de','del','para','por','con','y','o','u','un','una','unos','unas','al','en','mi','tu','su','sus','que','qué','como','cómo','quiero','necesito','recomiendas','recomendar','limpiar','limpieza','baño','bano','mucho','poco','tengo','hay','me','mi']);
+/* ===== Nueva lógica de recomendación: priorizar TÍTULO + superficie ===== */
+const GENERIC_TOKENS = new Set(['limpiar','limpieza','limpiador','limpiadores']);
+const STOPWORDS = new Set([
+  'la','el','los','las','de','del','para','por','con','y','o','u','un','una','unos','unas','al','en','mi','tu','su','sus',
+  'que','qué','como','cómo','quiero','necesito','recomiendas','recomendar','limpiar','limpieza','mucho','poco','tengo','hay','me','mi'
+  // ojo: NO incluimos baño/bano aquí
+]);
+
 function tokenClean(s=''){
-  return norm(s).replace(/[^a-z0-9\s]/g,' ').split(/\s+/).filter(Boolean).map(t=>t.replace(/s$/,'')).filter(t=>t.length>=3 && !STOPWORDS.has(t));
+  return norm(s)
+    .replace(/[^a-z0-9\s]/g,' ')
+    .split(/\s+/)
+    .filter(Boolean)
+    .map(t=>t.replace(/s$/,''))
+    .filter(t=>t.length>=3 && !STOPWORDS.has(t));
+}
+
+/* ----- Superficies / áreas y penalizaciones por choque ----- */
+function detectSurface(text=''){
+  const q = norm(text);
+  if (/\b(baño|bano|wc)\b/.test(q)) return 'bano';
+  if (/\b(cocina)\b/.test(q)) return 'cocina';
+  if (/\b(alfombra|tapiz|tapiceria)\b/.test(q)) return 'alfombra';
+  if (/\b(piso|pisos|parquet|flotante)\b/.test(q)) return 'pisos';
+  if (/\b(vidrio|ventana|cristal)\b/.test(q)) return 'vidrio';
+  if (/\b(madera)\b/.test(q)) return 'madera';
+  if (/\b(acero|inox|acero inoxidable)\b/.test(q)) return 'acero';
+  if (/\b(ropa|polera|camisa|jean|zapatilla)\b/.test(q)) return 'ropa';
+  return null;
+}
+
+function surfaceQueryBoost(surface){
+  switch(surface){
+    case 'bano':    return ['limpiador baño','antihongos baño','quita sarro baño','desinfectante baño','wc'];
+    case 'cocina':  return ['desengrasante cocina','limpiador cocina','antigrasa cocina','acero inoxidable cocina'];
+    case 'alfombra':return ['limpiador alfombra','tapicería','quitamanchas alfombra','dr beckmann'];
+    case 'pisos':   return ['limpiador pisos','bona','lithofin','abrillantador pisos'];
+    case 'vidrio':  return ['limpia vidrios','glass cleaner','antiempañante vidrio'];
+    case 'madera':  return ['limpiador madera','acondicionador madera','abrillantador madera'];
+    case 'acero':   return ['limpiador acero inoxidable','weiman acero','polish acero'];
+    case 'ropa':    return ['quitamanchas ropa','blanqueador ropa','detergente capsulas'];
+    default:        return [];
+  }
+}
+
+const SURFACE_CLASH = {
+  bano:    ['madera','granito','vidrio','parquet'],
+  cocina:  ['baño','wc'],
+  alfombra:['madera','acero','vidrio'],
+  pisos:   ['alfombra','tapiz'],
+  vidrio:  ['madera','alfombra'],
+  madera:  ['baño','wc'],
+  acero:   ['madera','alfombra'],
+  ropa:    ['madera','parrilla','pisos']
+};
+
+function clashPenalty(userSurface, title=''){
+  if (!userSurface) return 0;
+  const t = norm(title);
+  const clashes = SURFACE_CLASH[userSurface] || [];
+  let penalty = 0;
+  for (const word of clashes){
+    if (t.includes(norm(word))) penalty -= 2; // penalización suave
+  }
+  return penalty;
 }
 
 function makeQueriesFromText(text=''){
   const toks = tokenClean(text);
   const queries = [];
+
+  // 1) Empujar boosts por superficie (si aplica)
+  const surface = detectSurface(text);
+  const boosts = surface ? surfaceQueryBoost(surface) : [];
+  for (const b of boosts) queries.push(b);
+
+  // 2) Todos los tokens (excepto genéricos) y cada token individual útil
   if (toks.length) {
-    queries.push(toks.join(' ')); // todos los tokens
-    for (const t of toks) queries.push(t); // cada token individual
+    const joined = toks.filter(t => !GENERIC_TOKENS.has(t)).join(' ').trim();
+    if (joined) queries.push(joined);
+    for (const t of toks){
+      if (!GENERIC_TOKENS.has(t)) queries.push(t);
+    }
   }
-  // añadir clave shopping synonyms si aparece literalmente en el texto
+
+  // 3) Añadir claves de SHOPPING_SYNONYMS si aparecen literalmente
   for (const key of Object.keys(SHOPPING_SYNONYMS)) {
     if (norm(text).includes(norm(key))) queries.push(key);
   }
-  // dedup y limitar
+
+  // 4) dedup y limitar
   const seen=new Set(); const out=[];
   for (const q of queries) {
-    const k = q.trim();
+    const k = String(q||'').trim();
     if (!k || seen.has(k)) continue;
     seen.add(k); out.push(k);
-    if (out.length>=10) break;
+    if (out.length>=12) break;
   }
   return out.length ? out : [String(text||'').slice(0,120)];
 }
@@ -269,6 +343,10 @@ function makeQueriesFromText(text=''){
 async function buildPoolByQueries(queries, cap=72){
   const pool=[]; const seen=new Set();
   for (const q of queries){
+    // Evita consultas que sean SOLO genéricas
+    const onlyGeneric = GENERIC_TOKENS.has(norm(q));
+    if (onlyGeneric) continue;
+
     const found = await searchProductsPlain(q, 18).catch(()=>[]);
     for (const it of found){
       if (!seen.has(it.handle)){
@@ -292,8 +370,12 @@ function scoreTitleStrict(userText, title){
     const union = new Set([...uSet, ...tSet]).size || 1;
     return inter/union;
   })();
-  // score: título pesa mucho; disponibilidad se suma después
-  return { hits, jacc, score: (hits*3) + (jacc*1.2) };
+
+  // Penalización por choque de superficie
+  const surf = detectSurface(userText||'');
+  const penalty = clashPenalty(surf, title);
+
+  return { hits, jacc, score: (hits*3) + (jacc*1.2) + penalty };
 }
 
 async function recommendByTitleFirst(userText, max=6){
@@ -308,27 +390,10 @@ async function recommendByTitleFirst(userText, max=6){
 
   // 1) Si hay coincidencias en título, usamos sólo esas
   let candidates = scored.filter(x=>x._hits > 0);
-  // 2) Si no hubo, permitimos cero-hits pero con jaccard > 0 via título (muy raro) o caeremos a fallback
+  // 2) Si no hubo, permitimos cero-hits pero con jaccard > 0 vía título, o caer a fallback
   if (!candidates.length) candidates = scored.filter(x=>x._jacc > 0);
 
-  if (!candidates.length) {
-    // 3) Fallback: usa shopping synonyms directos (como 'alfombra', 'baño', etc.)
-    for (const key of Object.keys(SHOPPING_SYNONYMS)) {
-      if (norm(userText).includes(norm(key))) {
-        const found = await searchProductsPlain(key, 18).catch(()=>[]);
-        if (found.length) {
-          const rescored = found.map(p=>{
-            const { hits, jacc, score } = scoreTitleStrict(userText, p.title||'');
-            return { ...p, _hits: hits, _jacc: jacc, _score: score };
-          });
-          candidates = rescored;
-          break;
-        }
-      }
-    }
-  }
-
-  // 4) Último fallback: tu titleMatchProducts (coincidencias simples en título)
+  // 3) Último fallback
   if (!candidates.length) {
     const fallback = await titleMatchProducts(userText, max);
     return fallback;
@@ -378,7 +443,10 @@ async function aiProductQuery(userText){
     const raw = (ai.choices?.[0]?.message?.content || '').trim();
     const m = raw.match(/\{[\s\S]*\}/);
     const parsed = JSON.parse(m ? m[0] : raw);
-    const keywords = Array.isArray(parsed.keywords) ? parsed.keywords.map(s=>String(s).trim()).filter(Boolean).slice(0,6) : [];
+    // Filtrar keywords si son 100% genéricas
+    const keywords = Array.isArray(parsed.keywords)
+      ? parsed.keywords.map(s=>String(s).trim()).filter(Boolean).filter(k=>!GENERIC_TOKENS.has(norm(k))).slice(0,6)
+      : [];
     const brands   = Array.isArray(parsed.brands)   ? parsed.brands.map(s=>String(s).trim()).filter(Boolean).slice(0,3)   : [];
     const max      = Math.max(3, Math.min(8, Number(parsed.max || 6) || 6));
     return { keywords, brands, max };
@@ -394,6 +462,7 @@ async function searchByQueries(keywords=[], brands=[], max=6){
 
   const queries = [];
   for (const k of keywords){
+    if (!k || GENERIC_TOKENS.has(norm(k))) continue;
     queries.push(k);
     for (const b of brands){
       queries.push(`${k} ${b}`);
@@ -788,7 +857,7 @@ app.post('/chat', async (req,res)=>{
 
     /* ---- IA para info (paso a paso) + recomendaciones — PRIORIDAD TÍTULO ---- */
     if (intent === 'info' || intent === 'browse'){
-      // 1) Primero, recomendación por coincidencia en TÍTULO
+      // 1) Primero, recomendación por coincidencia en TÍTULO (+superficie/penalización)
       let items = [];
       try {
         items = await recommendByTitleFirst(message||'', 6);
@@ -796,7 +865,7 @@ app.post('/chat', async (req,res)=>{
         console.warn('[recommendByTitleFirst] error', err?.message||err);
       }
 
-      // 2) Si no hubo resultados, IA→keywords/brands (secundario)
+      // 2) Si no hubo resultados, IA→keywords/brands (secundario, con filtro genéricos)
       if (!items.length){
         try{
           const { keywords, brands, max } = await aiProductQuery(message||'');
@@ -834,7 +903,7 @@ app.post('/chat', async (req,res)=>{
         }
       }
 
-      // 4) TIP (consejos) — lo mantenemos, pero la lista de productos ya está orientada por título
+      // 4) TIP (consejos)
       let tipText = '';
       try{
         const ai = await openai.chat.completions.create({
