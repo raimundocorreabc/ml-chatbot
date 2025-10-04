@@ -1,4 +1,5 @@
-// server.js — IA-first + catálogo/brands/envíos/regiones/shopping-list + IA→keywords→Shopify + STOCK (mejorado + ranker)
+// server.js — IA-first + catálogo/brands/envíos/regiones/shopping-list
+// + IA→keywords→Shopify + STOCK (mejorado) + Ranker título→ranking→descripción
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
@@ -68,30 +69,38 @@ async function listCollections(limit = 10){
   return (d.collections?.edges||[]).map(e=>({ title:e.node.title, handle:e.node.handle }));
 }
 
-/* === MOD: incluye description para rankear mejor === */
 async function searchProductsPlain(query, first = 5){
   const d = await gql(`
     query($q:String!,$n:Int!){
       search(query:$q, types: PRODUCT, first:$n){
-        edges{
-          node{
-            ... on Product {
-              title
-              handle
-              availableForSale
-              description
-            }
-          }
-        }
+        edges{ node{ ... on Product { title handle availableForSale } } }
       }
     }
   `,{ q: query, n: first });
-  return (d.search?.edges||[]).map(e=>({
-    title: e.node.title,
-    handle: e.node.handle,
-    availableForSale: !!e.node.availableForSale,
-    description: e.node.description || ''
-  }));
+  return (d.search?.edges||[]).map(e=>({ title:e.node.title, handle:e.node.handle, availableForSale: !!e.node.availableForSale }));
+}
+
+async function fetchProductMetaByHandle(handle){
+  const d = await gql(`
+    query($h:String!){
+      productByHandle(handle:$h){
+        title
+        handle
+        availableForSale
+        vendor
+        description
+      }
+    }
+  `,{ h: handle });
+  const p = d.productByHandle;
+  if (!p) return null;
+  return {
+    title: p.title,
+    handle: p.handle,
+    availableForSale: !!p.availableForSale,
+    vendor: p.vendor || '',
+    description: p.description || ''
+  };
 }
 
 async function listTopSellers(first = 8){
@@ -142,79 +151,79 @@ async function preferInStock(items, need){
   return out;
 }
 
-/* ===== Relevancia por consulta (título > descripción) ===== */
-function strongTokens(s=''){
-  return String(s||'')
-    .normalize('NFD').replace(/[\u0300-\u036f]/g,'')
-    .toLowerCase()
-    .replace(/[^a-z0-9\s]/g,' ')
-    .split(/\s+/)
-    .filter(w => w && w.length >= 3);
+/* ===== Ranker: prioriza título → luego descripción (y disponible primero) ===== */
+const STOP = new Set(['de','del','para','con','en','la','el','los','las','y','o','por','una','un','al','lo']);
+const toks = s => norm(s).replace(/[^a-z0-9\s]/g,' ').split(/\s+/).filter(w=>w && !STOP.has(w));
+const hasPhrase = (haystack, phrase) => norm(haystack).includes(norm(phrase));
+
+function scoreTitle(title, userText){
+  const tks = new Set(toks(title));
+  const qs  = toks(userText);
+  let s = 0;
+  // 1) coincidencia de frase completa (muy fuerte)
+  if (hasPhrase(title, userText)) s += 6;
+  // 2) coincidencias token a token en título
+  for (const q of qs){ if (tks.has(q)) s += 2; }
+  // 3) bonus por palabras “tipo producto” comunes
+  if (tks.has('limpiador')) s += 1;
+  if (tks.has('alfombra') && /alfombra|tapicer/.test(norm(userText))) s += 2;
+  if (tks.has('quarzo') || tks.has('cuarzo')) if (/quarzo|cuarzo/.test(norm(userText))) s += 2;
+  return s;
 }
-function uniq(arr){ return Array.from(new Set(arr)); }
-
-function matchScore(product, queryText){
-  const q = uniq(strongTokens(queryText));
-  if (!q.length) return 0;
-
-  const titleTokens = new Set(strongTokens(product.title));
-  const descTokens  = new Set(strongTokens(product.description || ''));
-
-  const allInTitle = q.every(t => titleTokens.has(t));
-  const titleHits = q.reduce((n,t)=> n + (titleTokens.has(t) ? 1 : 0), 0);
-  const descHits  = q.reduce((n,t)=> n + (descTokens.has(t)  ? 1 : 0), 0);
-
-  let score = 0;
-  if (allInTitle) score += 100;  // match fuerte en título
-  score += titleHits * 6;
-  score += descHits  * 1.5;
-
-  if (product.availableForSale) score += 3;
-
-  return score;
+function scoreDesc(desc, userText){
+  if (!desc) return 0;
+  let s = 0;
+  if (hasPhrase(desc, userText)) s += 3;
+  const q = toks(userText);
+  const d = new Set(toks(desc));
+  for (const w of q){ if (d.has(w)) s += 0.5; }
+  return s;
 }
 
-function smartRankProducts(queryText, pool, max=6){
-  if (!Array.isArray(pool) || !pool.length) return [];
-  const q = uniq(strongTokens(queryText));
+async function rankProductsByTitleThenDescription(userText, initialPool){
+  if (!initialPool || !initialPool.length) return [];
 
-  const hasAllInTitle = p => q.every(t => strongTokens(p.title).includes(t));
+  // 1) puntuación por título
+  const withTitleScore = initialPool.map(p => ({
+    ...p,
+    _t: scoreTitle(p.title||'', userText)
+  }));
 
-  const strictTitle = pool.filter(hasAllInTitle)
-    .sort((a,b)=> matchScore(b,queryText) - matchScore(a,queryText));
+  // Si ya hay buenos títulos, cortamos shortlist
+  let shortlist = withTitleScore.sort((a,b)=> b._t - a._t).slice(0, 12);
 
-  const partialTitle = pool.filter(p =>
-    !strictTitle.includes(p) &&
-    q.some(t => strongTokens(p.title).includes(t))
-  ).sort((a,b)=> matchScore(b,queryText) - matchScore(a,queryText));
+  // 2) enriquecer con descripción SOLO si los títulos no son claros
+  const needDesc = (shortlist[0]?._t || 0) < 6; // si no hubo frase fuerte
+  if (needDesc){
+    // Traer descripción para la shortlist
+    const metas = await Promise.all(shortlist.map(x => fetchProductMetaByHandle(x.handle).catch(()=>null)));
+    const metaMap = new Map();
+    metas.forEach(m => { if (m) metaMap.set(m.handle, m); });
 
-  const byDesc = pool.filter(p =>
-    !strictTitle.includes(p) &&
-    !partialTitle.includes(p) &&
-    q.some(t => strongTokens(p.description||'').includes(t))
-  ).sort((a,b)=> matchScore(b,queryText) - matchScore(a,queryText));
-
-  const merged = [...strictTitle, ...partialTitle, ...byDesc];
-
-  const seen = new Set();
-  const out = [];
-  for (const p of merged){
-    if (seen.has(p.handle)) continue;
-    seen.add(p.handle);
-    out.push(p);
-    if (out.length >= max) break;
+    shortlist = shortlist.map(p => {
+      const meta = metaMap.get(p.handle);
+      const dScore = meta ? scoreDesc(meta.description||'', userText) : 0;
+      return { ...p, _d: dScore };
+    });
+  } else {
+    shortlist = shortlist.map(p => ({ ...p, _d: 0 }));
   }
 
-  out.sort((a,b) => (b.availableForSale?1:0) - (a.availableForSale?1:0));
-  return out;
+  // 3) ordenar final: disponible primero, luego título, luego desc
+  const ordered = shortlist.sort((a,b)=>{
+    if (a.availableForSale !== b.availableForSale) return a.availableForSale ? -1 : 1;
+    if (b._t !== a._t) return b._t - a._t;
+    return (b._d||0) - (a._d||0);
+  });
+
+  return ordered;
 }
 
 /* ----- Shipping regiones/comunas + zonas ----- */
 const REGIONES_LIST = [
   'Arica y Parinacota','Tarapacá','Antofagasta','Atacama',
   'Coquimbo','Valparaíso',"O’Higgins","O'Higgins",'Maule','Ñuble','Biobío','Araucanía','Los Ríos','Los Lagos',
-  'Metropolitana','Santiago',
-  'Aysén','Magallanes'
+  'Metropolitana','Santiago','Aysén','Magallanes'
 ];
 const REGIONES_F = new Set(REGIONES_LIST.map(fold));
 const COMUNAS = ['Las Condes','Vitacura','Lo Barnechea','Providencia','Ñuñoa','La Reina','Santiago','Macul','La Florida','Puente Alto','Maipú','Maipu','Huechuraba','Independencia','Recoleta','Quilicura','Conchalí','Conchali','San Miguel','San Joaquín','San Joaquin','La Cisterna','San Bernardo','Colina','Buin','Lampa'];
@@ -230,8 +239,8 @@ const REGION_COST_MAP = (()=>{ const m=new Map(); for(const z of SHIPPING_ZONES)
 const shippingByRegionName = (s='') => REGION_COST_MAP.get(fold(s)) || null;
 
 function regionsPayloadLines(){
-  const uniqR = Array.from(new Set(REGIONES_LIST.map(r=>r.replace(/\"/g,''))));
-  return uniqR.map(r => `${r}|${r}`).join('\n');
+  const uniq = Array.from(new Set(REGIONES_LIST.map(r=>r.replace(/\"/g,''))));
+  return uniq.map(r => `${r}|${r}`).join('\n');
 }
 
 /* ----- Shopping list (1 por ítem, mismo orden) ----- */
@@ -255,7 +264,6 @@ function splitShopping(text=''){
   return base.split(/,|\by\b/gi).map(s=>s.trim()).filter(Boolean);
 }
 
-/* === MOD: usa ranker para elegir el mejor match por ítem === */
 async function bestMatchForPhrase(phrase){
   const p = phrase.toLowerCase().trim();
   const syn = SHOPPING_SYNONYMS[p] || [p];
@@ -272,8 +280,7 @@ async function bestMatchForPhrase(phrase){
     }
   }
   if (!pool.length) return null;
-  const ranked = smartRankProducts(phrase, pool, 1);
-  return ranked[0] || pool[0];
+  return (await preferInStock(pool,1))[0] || pool[0];
 }
 
 async function selectProductsByOrderedKeywords(message){
@@ -287,7 +294,7 @@ async function selectProductsByOrderedKeywords(message){
   return picks.length ? picks : null;
 }
 
-/* ----- Búsqueda precisa por título (fallback) ----- */
+/* ----- Búsqueda precisa por título (fallback clásico) ----- */
 function extractKeywords(text='', max=8){
   const tokens = tokenize(text).filter(t => t.length>=3);
   const stop = new Set(['tienen','venden','quiero','necesito','precio','productos','producto','limpieza','limpiar','ayuda','me','puedes','recomendar','stock','stok','disponible','disponibilidad','quedan','inventario','cuanto','cuánta','cuánta']);
@@ -301,12 +308,39 @@ function extractKeywords(text='', max=8){
   }
   return bag;
 }
-
-/* === MOD: delega el orden al ranker === */
 async function titleMatchProducts(queryText, max=6){
-  const pool = await searchProductsPlain(String(queryText||'').slice(0,120), 50).catch(()=>[]);
+  const pool = await searchProductsPlain(String(queryText||'').slice(0,120), 24);
   if (!pool.length) return [];
-  return smartRankProducts(queryText, pool, max);
+  const kws = extractKeywords(queryText, 10);
+  if (!kws.length) return (await preferInStock(pool, max)).slice(0,max);
+  const fld = s => norm(s);
+  const scored = pool.map(p => {
+    const t = fld(p.title);
+    const hits = kws.reduce((n,kw)=> n + (t.includes(kw) ? 1 : 0), 0);
+    return { ...p, _hits: hits };
+  });
+  const byHits = scored.sort((a,b)=> b._hits - a._hits).filter(x=>x._hits>0);
+  const shortlist = byHits.length ? byHits.slice(0, max*2) : pool.slice(0, max*2);
+  const ordered = await preferInStock(shortlist, max);
+  return ordered;
+}
+
+/* ====== Expansor semántico de superficies ====== */
+function semanticQueryExpansion(text=''){
+  const q = norm(text);
+  const patterns = [
+    { key: 'alfombra', match: /(alfombra|tapiz|tapicer|moqueta)/, queries: ['limpiador alfombra', 'limpiador tapiceria', 'dr beckmann alfombra', 'astonish tapicerias'] },
+    { key: 'vidrio', match: /(vidrio|ventana|cristal)/, queries: ['limpiavidrios', 'weiman glass', 'limpiador vidrio'] },
+    { key: 'acero', match: /(acero|inox)/, queries: ['weiman acero', 'limpiador acero inoxidable'] },
+    { key: 'cocina', match: /(cocina|encimera|horn|grasa)/, queries: ['desengrasante cocina', 'weiman cocina', 'goo gone grill'] },
+    { key: 'baño', match: /(bañ|inodoro|ducha|lavamanos|ceramic)/, queries: ['limpiador baño', 'antihongos', 'astonish baño'] },
+    { key: 'piedra', match: /(granito|marmol|cuarzo|quarzo|piedra)/, queries: ['weiman granite', 'limpiador piedra', 'limpiador cuarzo'] },
+    { key: 'piso', match: /(piso|madera|laminado|parquet)/, queries: ['limpiador pisos', 'bona piso', 'weiman piso'] },
+  ];
+  for (const p of patterns){
+    if (p.match.test(q)) return p.queries;
+  }
+  return null;
 }
 
 /* ----- IA (TIP sin CTA) ----- */
@@ -353,7 +387,7 @@ async function aiProductQuery(userText){
   }
 }
 
-/* === MOD: aplicar ranker al consolidado de queries === */
+// Ejecuta varias consultas a Shopify combinando keywords y (si hay) marca
 async function searchByQueries(keywords=[], brands=[], max=6){
   const pool=[]; const seen=new Set();
 
@@ -376,16 +410,15 @@ async function searchByQueries(keywords=[], brands=[], max=6){
       if (!seen.has(it.handle)){
         seen.add(it.handle);
         pool.push(it);
-        if (pool.length >= max*4) break;
+        if (pool.length >= max*3) break;
       }
     }
-    if (pool.length >= max*4) break;
+    if (pool.length >= max*3) break;
   }
-  return smartRankProducts(keywords.join(' ') || brands.join(' ') || '', pool, max);
+  return await preferInStock(pool, max);
 }
 
 /* ---------- STOCK helpers/intents (mejorados) ---------- */
-// incluye 'stok' y expresiones comunes de disponibilidad
 const STOCK_REGEX = /\b(stock|en\s+stock|stok|disponible|disponibilidad|quedan?|hay|tiene[n]?|inventario)\b/i;
 
 function extractHandleFromText(s=''){
@@ -393,7 +426,7 @@ function extractHandleFromText(s=''){
   return m ? m[1] : null;
 }
 
-// ===== nuevas utilidades para elegir el producto correcto en preguntas de stock =====
+// ===== Selección de producto para preguntas de stock =====
 const KNOWN_BRANDS = [
   'astonish','quix','dr beckmann','dr. beckmann','cif','weiman','lithofin',
   'goo gone','scrub daddy','scrub mommy','bona','the good one'
@@ -421,10 +454,7 @@ function scoreTitleForStock(title='', tokens=[], brandTokens=[]){
   const t = tokenizeStrict(title);
   const set = new Set(t);
   let score = 0;
-
-  for (const tok of tokens){
-    if (set.has(tok)) score += 1;
-  }
+  for (const tok of tokens){ if (set.has(tok)) score += 1; }
   for (const b of brandTokens){
     const parts = b.split(' ');
     if (parts.every(p => set.has(p))) score += 2;
@@ -439,7 +469,6 @@ function scoreTitleForStock(title='', tokens=[], brandTokens=[]){
 async function findHandleForStock(message='', meta={}){
   const brandTokens = extractBrandTokens(message);
   const rawTokens = tokenizeStrict(message).filter(w => w.length >= 3);
-
   const stop = new Set(['la','el','de','del','para','con','una','un','los','las','tienen','tiene','hay','queda','quedan','stock','en','cuanto','cuánta','cuanta','original','producto']);
   const tokens = rawTokens.filter(t => !stop.has(t));
 
@@ -474,20 +503,14 @@ async function findHandleForStock(message='', meta={}){
   }
   if (!pool.length) return null;
 
-  const scored = pool.map(p => ({
-    ...p,
-    _score: scoreTitleForStock(p.title, tokens, brandTokens),
-  }));
-
+  const scored = pool.map(p => ({ ...p, _score: scoreTitleForStock(p.title, tokens, brandTokens) }));
   const good = scored.filter(x => x._score >= 2);
   const requirePasta = tokens.includes('pasta');
   const candidateList = (requirePasta ? good.filter(x => /pasta/i.test(x.title)) : good);
 
   const list = (candidateList.length ? candidateList : scored)
     .sort((a,b)=>{
-      if (a.availableForSale !== b.availableForSale){
-        return a.availableForSale ? -1 : 1;
-      }
+      if (a.availableForSale !== b.availableForSale) return a.availableForSale ? -1 : 1;
       return b._score - a._score;
     });
 
@@ -504,8 +527,6 @@ const PURPOSE_REGEX = /\b(para que sirve|para qué sirve|que es|qué es|como usa
 
 function detectIntent(text=''){
   const q = norm(text);
-
-  // Si viene "envío <lugar>", rutear a shipping_region
   const m = String(text||'').match(/^env[ií]o\s+(.+)$/i);
   if (m) {
     const loc = fold(m[1]);
@@ -588,14 +609,10 @@ app.post('/chat', async (req,res)=>{
         handle = extractHandleFromText(meta.page.url);
       }
 
-      // Mejor selección por texto si aún no tenemos handle
       if (!handle) {
-        try {
-          handle = await findHandleForStock(message || '', meta);
-        } catch {}
+        try { handle = await findHandleForStock(message || '', meta); } catch {}
       }
 
-      // fallback final
       if (!handle) {
         try {
           const found = await titleMatchProducts(message || '', 1);
@@ -615,33 +632,23 @@ app.post('/chat', async (req,res)=>{
       if (info.total !== null) {
         const qty = info.total;
         const header = `Actualmente contamos con ${qty} ${pluralUnidad(qty)} ${pluralDisponible(qty)} de **${info.title}**.`;
-
         const withQty = info.variants.filter(v => typeof v.quantityAvailable === 'number');
 
         if (withQty.length === 1) {
           const v = withQty[0];
           const label = isDefaultVariantTitle(v.title) ? '**Stock disponible:**' : `**Variante ${v.title} — Stock:**`;
-          return res.json({
-            text: `${header}\n${label} ${v.quantityAvailable} ${pluralUnidad(v.quantityAvailable)}`
-          });
+          return res.json({ text: `${header}\n${label} ${v.quantityAvailable} ${pluralUnidad(v.quantityAvailable)}` });
         }
-
         if (withQty.length > 1) {
           const lines = withQty.map(v => {
             const name = isDefaultVariantTitle(v.title) ? 'Variante única' : `Variante ${v.title}`;
             return `- ${name}: ${v.quantityAvailable} ${pluralUnidad(v.quantityAvailable)}`;
           });
-          return res.json({
-            text: `${header}\n**Detalle por variante:**\n${lines.join('\n')}`
-          });
+          return res.json({ text: `${header}\n**Detalle por variante:**\n${lines.join('\n')}` });
         }
-
-        return res.json({
-          text: `${header}\n**Stock disponible:** ${qty} ${pluralUnidad(qty)}`
-        });
+        return res.json({ text: `${header}\n**Stock disponible:** ${qty} ${pluralUnidad(qty)}` });
       }
 
-      // Cuando la tienda no expone cantidad exacta, informar disponibilidad
       const avail = info.variants.filter(v => v.available);
       if (avail.length) {
         const header = `Disponibilidad de **${info.title}**:`;
@@ -744,10 +751,10 @@ app.post('/chat', async (req,res)=>{
       if (picks && picks.length){
         return res.json({ text: `Te dejo una opción por ítem:\n\n${buildProductsMarkdown(picks)}` });
       }
-      // si no hubo match, caemos a IA+browse
+      // si no hubo match, seguimos abajo al flujo general
     }
 
-    /* ---- IA para info (paso a paso) + recomendaciones reales desde Shopify ---- */
+    /* ---- IA para info (paso a paso) + recomendaciones desde Shopify con ranker ---- */
     if (intent === 'info' || intent === 'browse'){
       let tipText = '';
       try{
@@ -765,35 +772,38 @@ app.post('/chat', async (req,res)=>{
       }
 
       let items = [];
-      try{
-        const { keywords, brands, max } = await aiProductQuery(message||'');
-        if (keywords.length || brands.length){
-          items = await searchByQueries(keywords, brands, Math.min(6, max));
+
+      // 0) Expansor semántico (si la consulta es “superficie/uso” claro)
+      const semanticQueries = semanticQueryExpansion(message||'');
+      if (semanticQueries){
+        const pool=[]; const seen=new Set();
+        for (const q of semanticQueries){
+          const found = await searchProductsPlain(q, 12).catch(()=>[]);
+          for (const it of found){ if(!seen.has(it.handle)){ seen.add(it.handle); pool.push(it); } }
         }
-      }catch(err){
-        console.warn('[searchByQueries] error', err?.message||err);
+        if (pool.length){
+          items = await rankProductsByTitleThenDescription(message||'', pool).then(xs=>preferInStock(xs,6));
+        }
       }
 
+      // 1) Si aún vacío, usar extractor IA → queries → ranker
       if (!items.length){
-        const qn = norm(message||'');
-        if (/(impermeabiliz|protector).*(sillon|sof[aá]|tapiz)/.test(qn)) {
-          items = await searchProductsPlain('protector textil', 12).then(xs=>preferInStock(xs,3));
-        } else if (/(olla).*(quemad)/.test(qn)) {
-          const pool = [];
-          for (const q of ['pink stuff pasta','desengrasante cocina','limpieza acero inox']){
-            const found = await searchProductsPlain(q, 6); pool.push(...found);
+        try{
+          const { keywords, brands, max } = await aiProductQuery(message||'');
+          if (keywords.length || brands.length){
+            const pool = await searchByQueries(keywords, brands, Math.min(12, Math.max(6, max)));
+            if (pool.length){
+              items = await rankProductsByTitleThenDescription(message||'', pool).then(xs=>preferInStock(xs,6));
+            }
           }
-          items = await preferInStock(pool,3);
-        } else if (/(mesa|vidrio).*(limpiar|mancha|grasa|sarro)/.test(qn) || /limpia\s*vidri/.test(qn)) {
-          items = await searchProductsPlain('limpia vidrios', 10).then(xs=>preferInStock(xs,3));
-        } else if (/(lavalozas|lava loza|lavaplatos)/.test(qn)) {
-          items = await searchProductsPlain('lavalozas', 12).then(xs=>preferInStock(xs,6));
-        } else if (/(parrilla|bbq|grill)/.test(qn)) {
-          const pool = [];
-          for (const q of ['limpiador parrilla','goo gone bbq','desengrasante parrilla']) {
-            const found = await searchProductsPlain(q, 6); pool.push(...found);
-          }
-          items = await preferInStock(pool,6);
+        }catch(err){ console.warn('[searchByQueries] error', err?.message||err); }
+      }
+
+      // 2) Fallback clásico: titleMatch (y luego re-ordenar por ranker)
+      if (!items.length){
+        const pool = await searchProductsPlain(String(message||'').slice(0,120), 24);
+        if (pool.length){
+          items = await rankProductsByTitleThenDescription(message||'', pool).then(xs=>preferInStock(xs,6));
         } else {
           items = await titleMatchProducts(message||'', 6);
         }
@@ -820,4 +830,3 @@ app.post('/chat', async (req,res)=>{
 app.get('/health', (_,res)=>res.json({ ok:true }));
 const port = PORT || process.env.PORT || 3000;
 app.listen(port, ()=>console.log('ML Chat server on :'+port));
-
