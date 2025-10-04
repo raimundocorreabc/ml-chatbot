@@ -1,5 +1,5 @@
 // server.js — IA-first + catálogo/brands/envíos/regiones/shopping-list + IA→keywords→Shopify + STOCK
-// (mejorado: título primero, "cocina" preciso, WC desodorante, intent stock menos agresivo)
+// (mejorado: título primero, "cocina" preciso, WC desodorante, intent stock menos agresivo, cookware/ollas y fallback a descripción)
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
@@ -177,13 +177,19 @@ const SHOPPING_SYNONYMS = {
   // WC desodorante/neutralizador/aromatizante
   'desodorante wc': ['desodorante wc','neutralizador wc','neutralizador olores wc','spray wc','aromatizante wc','desodorante baño wc','dejapoo'],
   'desodorante baño': ['desodorante baño','aromatizante baño','spray baño','neutralizador olores baño','dejapoo'],
-  'neutralizador wc': ['neutralizador wc','neutralizador olores wc','desodorante wc','spray wc','dejapoo']
+  'neutralizador wc': ['neutralizador wc','neutralizador olores wc','desodorante wc','spray wc','dejapoo'],
+
+  // Ollas / sartenes / cacerolas (shopping)
+  'ollas': [
+    'pasta multiuso','pink stuff pasta','desengrasante cocina','limpiador acero inoxidable',
+    'lavalozas','esponja','fibra','scrub daddy','sarten','cacerola','olla'
+  ]
 };
 
 // Marcas conocidas (para vendor:)
 const KNOWN_BRANDS = [
   'astonish','weiman','goo gone','dr beckmann','dr. beckmann','kh7','kh-7','bona','lithofin',
-  'rexona','febreze','vileda','quix','dejapoo'
+  'rexona','febreze','vileda','quix','dejapoo','the pink stuff','pink stuff'
 ];
 
 const tokenize = s => norm(s).replace(/[^a-z0-9\s]/g,' ').split(/\s+/).filter(Boolean);
@@ -203,6 +209,25 @@ function splitShopping(text=''){
   return base.split(/,|\by\b/gi).map(s=>s.trim()).filter(Boolean);
 }
 
+// Queries dirigidas a la descripción (body:)
+function bodyQueriesFromText(text=''){
+  const toks = tokenClean(text).filter(t => !GENERIC_TOKENS.has(t));
+  const qs = [];
+  if (toks.length){
+    qs.push(toks.map(t => `body:${t}`).join(' '));
+    for (const t of toks) qs.push(`body:${t}`);
+  }
+  const phrase = String(text||'').trim();
+  if (phrase.length >= 6) qs.push(`body:"${phrase.slice(0,100)}"`);
+  const seen = new Set(); const out = [];
+  for (const q of qs){
+    const k = q.trim(); if (!k || seen.has(k)) continue;
+    seen.add(k); out.push(k);
+    if (out.length >= 10) break;
+  }
+  return out;
+}
+
 // Construcción de queries “de precisión” para un segmento
 function buildPreciseQueriesForSegment(phrase){
   const q = phrase.trim();
@@ -211,8 +236,9 @@ function buildPreciseQueriesForSegment(phrase){
   const brand = detectBrandIn(q); // ej. "astonish"
   const isCocina = /\bcocina\b/.test(nq);
   const isWCDeo =
-    (/\b(desodorante|neutralizador|aromatizante|spray)\b/.test(nq) && /\b(wc|bañ|bano)\b/.test(nq)) ||
+    (/(\bdesodorante|neutralizador|aromatizante|spray)\b/.test(nq) && /(\bwc|bañ|bano)\b/.test(nq)) ||
     /\b(desodorante\s*wc|neutralizador\s*wc)\b/.test(nq);
+  const isCookware = /\b(olla|ollas|cacerol|sarten|sart[eé]n|sartenes)\b/.test(nq);
 
   const titleTokens = tokenize(q).filter(t => !['limpiar','limpieza','limpiador','multiuso','especialista','para','de'].includes(t));
   const hasGoodTitle = titleTokens.length >= 1;
@@ -261,6 +287,28 @@ function buildPreciseQueriesForSegment(phrase){
     }
   }
 
+  // 4ter) si es cookware (ollas/sartenes)
+  if (isCookware) {
+    const cw = [
+      'pasta multiuso','pink stuff pasta',
+      'desengrasante cocina','limpiador cocina',
+      'limpiador acero inoxidable',
+      'lavalozas','esponja','fibra','scrub daddy'
+    ];
+    for (const s of cw) queries.push(s);
+    if (brand) {
+      for (const s of cw) queries.push(`${s} vendor:${brand}`);
+      queries.push('title:olla vendor:'+brand);
+      queries.push('title:sarten vendor:'+brand);
+      queries.push('title:acero vendor:'+brand);
+    } else {
+      queries.push('title:olla');
+      queries.push('title:sarten');
+      queries.push('title:cacerola');
+      queries.push('title:acero inoxidable');
+    }
+  }
+
   // 5) Respaldo: tokens útiles (sin genéricos)
   const tokens = tokenize(q).filter(t => t.length>=3 && !['limpiar','limpieza','limpiador','especialista','de','para'].includes(t));
   if (tokens.length){
@@ -276,7 +324,7 @@ function buildPreciseQueriesForSegment(phrase){
     seen.add(k); out.push(k);
     if (out.length>=14) break;
   }
-  return { queries: out, brand, isCocina, isWCDeo };
+  return { queries: out, brand, isCocina, isWCDeo, isCookware };
 }
 
 async function bestMatchForPhrase(phrase){
@@ -284,7 +332,7 @@ async function bestMatchForPhrase(phrase){
   const syn = SHOPPING_SYNONYMS[p] || [p];
 
   // Precise-first strategy
-  const { queries: precise, brand, isCocina, isWCDeo } = buildPreciseQueriesForSegment(phrase);
+  const { queries: precise, brand, isCocina, isWCDeo, isCookware } = buildPreciseQueriesForSegment(phrase);
 
   const pool=[]; const seen=new Set();
   async function addBy(q, n=10){
@@ -314,22 +362,35 @@ async function bestMatchForPhrase(phrase){
     }
   }
 
+  // 3bis) ÚLTIMO recurso: buscar por descripción (body:)
+  if (!pool.length) {
+    const bqs = bodyQueriesFromText(phrase);
+    for (const q of bqs){
+      await addBy(q, 10);
+      if (pool.length >= 12) break;
+    }
+  }
+
   if (!pool.length) return null;
 
   // Filtros especiales por intención
   let filtered = pool;
 
-  // Si el usuario pidió "cocina", evitar BBQ/parrilla/grill y priorizar "cocina"
   if (isCocina){
     filtered = filtered.filter(p => !/bbq|parrilla|grill/i.test(p.title || ''));
     if (!filtered.length) filtered = pool;
   }
 
-  // Si es WC desodorante/neutralizador, evitar limpiadores "duros" de baño
   if (isWCDeo) {
     const hardCleaner = /limpiador|antisarro|desinfect|recarga\s+baño|kh7\s*baño/i;
     let f2 = filtered.filter(p => !hardCleaner.test(p.title || ''));
-    if (!f2.length) f2 = filtered; // no dejes vacío
+    if (!f2.length) f2 = filtered;
+    filtered = f2;
+  }
+
+  if (isCookware) {
+    let f2 = filtered.filter(p => !/piso|pisos|m[aá]rmol|parquet|bbq|parrilla|grill/i.test(p.title||''));
+    if (!f2.length) f2 = filtered;
     filtered = f2;
   }
 
@@ -338,6 +399,7 @@ async function bestMatchForPhrase(phrase){
     let bonus = 0;
     if (isCocina && /cocina/i.test(x.title||'')) bonus += 2;
     if (isWCDeo && /wc|neutralizador|aromatizante|spray|olores/i.test(x.title||'')) bonus += 3;
+    if (isCookware && /(olla|cacerol|sart[eé]n|sartenes|acero inoxidable|cookware)/i.test(x.title||'')) bonus += 3;
     if (brand && (x.vendor||'').toLowerCase().includes(brand)) bonus += 2;
     if (/\bdejapoo\b/.test(norm(phrase)) && /\bdejapoo\b/i.test(x.title||'')) bonus += 2;
     return { ...x, _bonus: bonus };
@@ -414,14 +476,15 @@ function tokenClean(s=''){
 /* ----- Superficies / áreas y penalizaciones por choque ----- */
 function detectSurface(text=''){
   const q = norm(text);
-  if (/\b(baño|bano|wc)\b/.test(q)) return 'bano';
-  if (/\b(cocina)\b/.test(q)) return 'cocina';
-  if (/\b(alfombra|tapiz|tapiceria)\b/.test(q)) return 'alfombra';
-  if (/\b(piso|pisos|parquet|flotante)\b/.test(q)) return 'pisos';
-  if (/\b(vidrio|ventana|cristal)\b/.test(q)) return 'vidrio';
-  if (/\b(madera)\b/.test(q)) return 'madera';
-  if (/\b(acero|inox|acero inoxidable)\b/.test(q)) return 'acero';
-  if (/\b(ropa|polera|camisa|jean|zapatilla)\b/.test(q)) return 'ropa';
+  if (/(\bbaño|\bbano|\bwc)\b/.test(q)) return 'bano';
+  if (/(\bcocina)\b/.test(q)) return 'cocina';
+  if (/(\balfombra|\btapiz|\btapiceria)\b/.test(q)) return 'alfombra';
+  if (/(\bpiso|\bpisos|\bparquet|\bflotante)\b/.test(q)) return 'pisos';
+  if (/(\bvidrio|\bventana|\bcristal)\b/.test(q)) return 'vidrio';
+  if (/(\bmadera)\b/.test(q)) return 'madera';
+  if (/(\bacero|\binox|\bacero inoxidable)\b/.test(q)) return 'acero';
+  if (/(\bropa|\bpolera|\bcamisa|\bjean|\bzapatilla)\b/.test(q)) return 'ropa';
+  if (/(\bolla|\bollas|\bcacerol|\bsarten|\bsart[eé]n|\bsartenes)\b/.test(q)) return 'ollas';
   return null;
 }
 
@@ -435,6 +498,13 @@ function surfaceQueryBoost(surface){
     case 'madera':  return ['limpiador madera','acondicionador madera','abrillantador madera'];
     case 'acero':   return ['limpiador acero inoxidable','weiman acero','polish acero'];
     case 'ropa':    return ['quitamanchas ropa','blanqueador ropa','detergente capsulas'];
+    case 'ollas':   return [
+      'pasta multiuso','pink stuff pasta',
+      'desengrasante cocina','limpiador cocina',
+      'limpiador acero inoxidable',
+      'lavalozas',
+      'esponja','fibra','scrub daddy'
+    ];
     default:        return [];
   }
 }
@@ -498,9 +568,6 @@ function makeQueriesFromText(text=''){
 async function buildPoolByQueries(queries, cap=72){
   const pool=[]; const seen=new Set();
   for (const q of queries){
-    const onlyGeneric = GENERIC_TOKENS.has(norm(q));
-    if (onlyGeneric) continue;
-
     const found = await searchProductsPlain(q, 18).catch(()=>[]);
     for (const it of found){
       if (!seen.has(it.handle)){
@@ -528,7 +595,13 @@ function scoreTitleStrict(userText, title){
   const surf = detectSurface(userText||'');
   const penalty = clashPenalty(surf, title);
 
-  return { hits, jacc, score: (hits*3) + (jacc*1.2) + penalty };
+  // BONUS específico ollas/sartenes/cacerolas/acero inoxidable
+  let surfaceBonus = 0;
+  if (surf === 'ollas') {
+    if (/(olla|cacerol|sart[eé]n|sartenes|cookware|acero inoxidable)/i.test(title||'')) surfaceBonus += 2;
+  }
+
+  return { hits, jacc, score: (hits*3) + (jacc*1.2) + penalty + surfaceBonus };
 }
 
 async function recommendByTitleFirst(userText, max=6){
@@ -545,8 +618,29 @@ async function recommendByTitleFirst(userText, max=6){
   if (!candidates.length) candidates = scored.filter(x=>x._jacc > 0);
 
   if (!candidates.length) {
+    // Fallback 1: título simple
     const fallback = await titleMatchProducts(userText, max);
-    return fallback;
+    if (fallback && fallback.length) return fallback;
+
+    // Fallback 2: descripción (body:)
+    const bqs = bodyQueriesFromText(userText);
+    const seen = new Set(); const bodyPool = [];
+    for (const q of bqs){
+      const found = await searchProductsPlain(q, 18).catch(()=>[]);
+      for (const it of found){
+        if (!seen.has(it.handle)){
+          seen.add(it.handle);
+          bodyPool.push(it);
+          if (bodyPool.length >= 36) break;
+        }
+      }
+      if (bodyPool.length >= 36) break;
+    }
+    if (bodyPool.length){
+      return bodyPool.sort((a,b)=> a.availableForSale !== b.availableForSale ? (a.availableForSale?-1:1) : 0).slice(0, max);
+    }
+
+    return [];
   }
 
   candidates.sort((a,b)=>{
@@ -644,7 +738,7 @@ async function searchByQueries(keywords=[], brands=[], max=6){
 const STOCK_REGEX = /\b(stock|en\s+stock|stok|disponible|disponibilidad|quedan?|inventario)\b/i;
 
 function extractHandleFromText(s=''){
-  const m = String(s||'').match(/\/products\/([a-z0-9\-_%.]+)/i);
+  const m = String(s||'').match(/\/products\/([a-z0-9\-_%\.]+)/i);
   return m ? m[1] : null;
 }
 
@@ -705,7 +799,7 @@ async function findHandleForStock(message='', meta={}){
   if (tokens.length) queries.push(tokens.join(' '));
 
   if (meta?.page?.url && /\/products\//i.test(meta.page.url)) {
-    const m = meta.page.url.match(/\/products\/([a-z0-9\-_%.]+)/i);
+    const m = meta.page.url.match(/\/products\/([a-z0-9\-_%\.]+)/i);
     if (m && m[1]) return m[1];
   }
 
@@ -942,7 +1036,7 @@ app.post('/chat', async (req,res)=>{
         ['LAVADO DE ROPA',  `${BASE}/search?q=ropa`],
         ['CUIDADO PERSONAL',`${BASE}/search?q=personal`],
         ['COCINA',          `${BASE}/search?q=cocina`],
-        ['BAÑO',            `${BASE}/search?q=ba%C3%B1o`],
+        ['BAÑO',            `${BASE}/search?q=ba% C3% B1o`.replace(/\s/g,'')],
         ['PISOS',           `${BASE}/search?q=pisos`],
       ];
       const payload = fallback.map(([t,u])=>`${t}|${u}`).join('\n');
@@ -1020,15 +1114,38 @@ app.post('/chat', async (req,res)=>{
 
       if (!items.length){
         const qn = norm(message||'');
+
         if (/(impermeabiliz|protector).*(sillon|sof[aá]|tapiz)/.test(qn)) {
           items = await searchProductsPlain('protector textil', 12).then(xs=>xs.slice(0,3));
-        } else if (/(olla).*(quemad)/.test(qn)) {
+        }
+        // Cookware en general
+        else if (/(olla|ollas|cacerol|sart[eé]n|sartenes)/.test(qn)) {
           const pool = [];
-          for (const q of ['pink stuff pasta','desengrasante cocina','limpieza acero inox']){
-            const found = await searchProductsPlain(q, 6); pool.push(...found);
+          const qs = [
+            'pasta multiuso','pink stuff pasta',
+            'desengrasante cocina','limpiador cocina',
+            'limpiador acero inoxidable',
+            'lavalozas',
+            'esponja','fibra','scrub daddy',
+            'title:olla','title:sarten','title:cacerola','title:acero inoxidable'
+          ];
+          for (const q of qs){
+            const found = await searchProductsPlain(q, 8).catch(()=>[]);
+            const cleaned = (found||[]).filter(p=>!/piso|pisos|m[aá]rmol|parquet|bbq|parrilla|grill/i.test(p.title||''));
+            pool.push(...cleaned);
           }
-          items = pool.slice(0,3);
-        } else if (/(mesa|vidrio).*(limpiar|mancha|grasa|sarro)/.test(qn) || /limpia\s*vidri/.test(qn)) {
+          const ranked = pool.map(x=>{
+            let bonus = 0;
+            if (/(olla|cacerol|sart[eé]n|sartenes|acero inoxidable|cookware)/i.test(x.title||'')) bonus += 3;
+            return { ...x, _bonus: bonus };
+          }).sort((a,b)=>{
+            if (a.availableForSale !== b.availableForSale) return a.availableForSale ? -1 : 1;
+            if (a._bonus !== b._bonus) return b._bonus - a._bonus;
+            return 0;
+          });
+          items = ranked.slice(0,6);
+        }
+        else if (/(mesa|vidrio).*(limpiar|mancha|grasa|sarro)/.test(qn) || /limpia\s*vidri/.test(qn)) {
           items = await searchProductsPlain('limpia vidrios', 10).then(xs=>xs.slice(0,3));
         } else if (/(lavalozas|lava loza|lavaplatos)/.test(qn)) {
           items = await searchProductsPlain('lavalozas', 12).then(xs=>xs.slice(0,6));
@@ -1039,7 +1156,21 @@ app.post('/chat', async (req,res)=>{
           }
           items = pool.slice(0,6);
         } else {
-          items = await titleMatchProducts(message||'', 6);
+          // Fallback adicional por descripción si aún no hay
+          const bqs = bodyQueriesFromText(message||'');
+          const seen = new Set(); const bodyPool = [];
+          for (const q of bqs){
+            const found = await searchProductsPlain(q, 18).catch(()=>[]);
+            for (const it of found){
+              if (!seen.has(it.handle)){
+                seen.add(it.handle);
+                bodyPool.push(it);
+                if (bodyPool.length >= 36) break;
+              }
+            }
+            if (bodyPool.length >= 36) break;
+          }
+          items = bodyPool.slice(0,6);
         }
       }
 
