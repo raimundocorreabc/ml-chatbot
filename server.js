@@ -1,4 +1,5 @@
-// server.js — IA-first + catálogo/brands/envíos/regiones/shopping-list + IA→keywords→Shopify + STOCK (mejorado, título primero, shopping cocina preciso)
+// server.js — IA-first + catálogo/brands/envíos/regiones/shopping-list + IA→keywords→Shopify + STOCK
+// (mejorado: título primero, "cocina" preciso, WC desodorante, intent stock menos agresivo)
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
@@ -170,13 +171,19 @@ const SHOPPING_SYNONYMS = {
   'acero':     ['limpiador acero inoxidable','weiman acero'],
   'protector textil': ['protector textil','impermeabilizante telas','fabric protector'],
 
-  // 🔥 Nuevo: cocina fuerte
-  'cocina': ['limpiador cocina','limpiador de cocina','antigrasa cocina','desengrasante cocina']
+  // Cocina fuerte
+  'cocina': ['limpiador cocina','limpiador de cocina','antigrasa cocina','desengrasante cocina'],
+
+  // WC desodorante/neutralizador/aromatizante
+  'desodorante wc': ['desodorante wc','neutralizador wc','neutralizador olores wc','spray wc','aromatizante wc','desodorante baño wc','dejapoo'],
+  'desodorante baño': ['desodorante baño','aromatizante baño','spray baño','neutralizador olores baño','dejapoo'],
+  'neutralizador wc': ['neutralizador wc','neutralizador olores wc','desodorante wc','spray wc','dejapoo']
 };
 
 // Marcas conocidas (para vendor:)
 const KNOWN_BRANDS = [
-  'astonish','weiman','goo gone','dr beckmann','dr. beckmann','kh7','kh-7','bona','lithofin','rexona','febreze','vileda','quix'
+  'astonish','weiman','goo gone','dr beckmann','dr. beckmann','kh7','kh-7','bona','lithofin',
+  'rexona','febreze','vileda','quix','dejapoo'
 ];
 
 const tokenize = s => norm(s).replace(/[^a-z0-9\s]/g,' ').split(/\s+/).filter(Boolean);
@@ -203,51 +210,54 @@ function buildPreciseQueriesForSegment(phrase){
 
   const brand = detectBrandIn(q); // ej. "astonish"
   const isCocina = /\bcocina\b/.test(nq);
+  const isWCDeo =
+    (/\b(desodorante|neutralizador|aromatizante|spray)\b/.test(nq) && /\b(wc|bañ|bano)\b/.test(nq)) ||
+    /\b(desodorante\s*wc|neutralizador\s*wc)\b/.test(nq);
 
   const titleTokens = tokenize(q).filter(t => !['limpiar','limpieza','limpiador','multiuso','especialista','para','de'].includes(t));
   const hasGoodTitle = titleTokens.length >= 1;
 
   const queries = [];
 
-  // 1) Frase exacta (Shopify soporta comillas para phrase match)
+  // 1) Frase exacta (phrase match)
   if (q.length >= 6) queries.push(`"${q.slice(0,120)}"`);
 
-  // 2) Synonym boosts (si hay clave directa)
+  // 2) Synonym boosts si aparece la clave
   for (const key of Object.keys(SHOPPING_SYNONYMS)){
     if (nq.includes(key)) {
       for (const s of SHOPPING_SYNONYMS[key]) queries.push(s);
     }
   }
-  // también si la frase es exactamente "limpiador de cocina" o similar
   if (/\blimpiador( de)? cocina\b/.test(nq)) {
     for (const s of SHOPPING_SYNONYMS['cocina']) queries.push(s);
   }
 
   // 3) title: + vendor:
   if (hasGoodTitle){
-    // intenta armar pares title: relevantes
     const titleTerms = [];
     if (isCocina) titleTerms.push('cocina');
     if (/bañ|bano|wc/.test(nq)) titleTerms.push('baño');
     if (/alfombra|tapiz|tapicer/.test(nq)) titleTerms.push('alfombra');
-
-    // si el usuario puso "limpiador", úsalo junto a la superficie
     if (/limpiador\b/.test(nq) && isCocina) titleTerms.push('limpiador');
 
-    // combinaciones de title:
     if (titleTerms.length){
       queries.push(titleTerms.map(t=>`title:${t}`).join(' '));
-      // con vendor si hay marca
       if (brand) queries.push(titleTerms.map(t=>`title:${t}`).join(' ') + ` vendor:${brand}`);
     }
   }
 
-  // 4) Marca directa
-  if (brand) {
-    queries.push(`vendor:${brand}`);
-    if (isCocina) {
-      queries.push(`title:cocina vendor:${brand}`);
-      queries.push(`title:cocina title:limpiador vendor:${brand}`);
+  // 4bis) si es desodorante/neutralizador WC, reforzar búsquedas
+  if (isWCDeo) {
+    const wcSyns = [
+      'desodorante wc','neutralizador wc','neutralizador olores wc','spray wc','aromatizante wc',
+      'desodorante baño wc','aromatizante baño wc','neutralizador olores baño wc'
+    ];
+    for (const s of wcSyns) queries.push(s);
+    if (brand) {
+      for (const s of wcSyns) queries.push(`${s} vendor:${brand}`);
+      queries.push(`title:wc vendor:${brand}`);
+      queries.push(`title:wc title:neutralizador vendor:${brand}`);
+      queries.push(`title:wc title:desodorante vendor:${brand}`);
     }
   }
 
@@ -266,7 +276,7 @@ function buildPreciseQueriesForSegment(phrase){
     seen.add(k); out.push(k);
     if (out.length>=14) break;
   }
-  return { queries: out, brand, isCocina };
+  return { queries: out, brand, isCocina, isWCDeo };
 }
 
 async function bestMatchForPhrase(phrase){
@@ -274,7 +284,7 @@ async function bestMatchForPhrase(phrase){
   const syn = SHOPPING_SYNONYMS[p] || [p];
 
   // Precise-first strategy
-  const { queries: precise, brand, isCocina } = buildPreciseQueriesForSegment(phrase);
+  const { queries: precise, brand, isCocina, isWCDeo } = buildPreciseQueriesForSegment(phrase);
 
   const pool=[]; const seen=new Set();
   async function addBy(q, n=10){
@@ -295,7 +305,7 @@ async function bestMatchForPhrase(phrase){
     for (const q of syn){ await addBy(q, 10); if (pool.length>=18) break; }
   }
 
-  // 3) tokens de respaldo (ya existían)
+  // 3) tokens de respaldo
   if (pool.length < 3) {
     const tokens = tokenize(phrase).filter(t=>t.length>=3).slice(0,3);
     for(const t of tokens){
@@ -306,19 +316,30 @@ async function bestMatchForPhrase(phrase){
 
   if (!pool.length) return null;
 
-  // 🔒 Filtro especial: si el usuario pidió "cocina", evitar BBQ/parrilla/grill y priorizar títulos con "cocina"
+  // Filtros especiales por intención
   let filtered = pool;
+
+  // Si el usuario pidió "cocina", evitar BBQ/parrilla/grill y priorizar "cocina"
   if (isCocina){
     filtered = filtered.filter(p => !/bbq|parrilla|grill/i.test(p.title || ''));
-    // si por filtro quedamos vacíos, volvamos al pool original (pero igual priorizaremos "cocina")
     if (!filtered.length) filtered = pool;
   }
 
-  // Re-rank: disponibles primero; si es cocina, puntear "cocina" en título
+  // Si es WC desodorante/neutralizador, evitar limpiadores "duros" de baño
+  if (isWCDeo) {
+    const hardCleaner = /limpiador|antisarro|desinfect|recarga\s+baño|kh7\s*baño/i;
+    let f2 = filtered.filter(p => !hardCleaner.test(p.title || ''));
+    if (!f2.length) f2 = filtered; // no dejes vacío
+    filtered = f2;
+  }
+
+  // Re-rank: disponibles primero; bonuses por señales
   const ranked = filtered.map(x=>{
     let bonus = 0;
     if (isCocina && /cocina/i.test(x.title||'')) bonus += 2;
+    if (isWCDeo && /wc|neutralizador|aromatizante|spray|olores/i.test(x.title||'')) bonus += 3;
     if (brand && (x.vendor||'').toLowerCase().includes(brand)) bonus += 2;
+    if (/\bdejapoo\b/.test(norm(phrase)) && /\bdejapoo\b/i.test(x.title||'')) bonus += 2;
     return { ...x, _bonus: bonus };
   }).sort((a,b)=>{
     if (a.availableForSale !== b.availableForSale) return a.availableForSale ? -1 : 1;
@@ -367,7 +388,6 @@ async function titleMatchProducts(queryText, max=6){
   });
   const byHits = scored.sort((a,b)=> b._hits - a._hits).filter(x=>x._hits>0);
   const shortlist = byHits.length ? byHits.slice(0, max*2) : pool.slice(0, max*2);
-  // disponibilidad primero pero manteniendo prioridad por hits
   const ordered = shortlist.sort((a,b)=>{
     if (a.availableForSale !== b.availableForSale) return a.availableForSale ? -1 : 1;
     return (b._hits||0) - (a._hits||0);
@@ -436,7 +456,7 @@ function clashPenalty(userSurface, title=''){
   const clashes = SURFACE_CLASH[userSurface] || [];
   let penalty = 0;
   for (const word of clashes){
-    if (t.includes(norm(word))) penalty -= 2; // penalización suave
+    if (t.includes(norm(word))) penalty -= 2;
   }
   return penalty;
 }
@@ -620,7 +640,8 @@ async function searchByQueries(keywords=[], brands=[], max=6){
 }
 
 /* ---------- STOCK helpers/intents ---------- */
-const STOCK_REGEX = /\b(stock|en\s+stock|stok|disponible|disponibilidad|quedan?|hay|tiene[n]?|inventario)\b/i;
+// ⚠️ Menos agresivo: quitamos "hay" y "tiene[n]?"
+const STOCK_REGEX = /\b(stock|en\s+stock|stok|disponible|disponibilidad|quedan?|inventario)\b/i;
 
 function extractHandleFromText(s=''){
   const m = String(s||'').match(/\/products\/([a-z0-9\-_%.]+)/i);
@@ -749,7 +770,7 @@ function detectIntent(text=''){
   if (/(categorias|categorías|tipos de productos|colecciones|que productos venden|qué productos venden)/.test(q)) return 'categories';
   if (PURPOSE_REGEX.test(text)) return 'info';
 
-  // Shopping list robusto: no por una sola coma
+  // Shopping list robusto: no por una sola coma casual
   const commaCount = (text.match(/,/g) || []).length;
   const looksLikeRealList = /\b\w+\b\s*,\s*\b\w+\b\s*(?:,|\by\b)\s*\b\w+\b/i.test(text);
   if (/(necesito:|lista:|comprar:|quiero:)/.test(q) || commaCount >= 2 || looksLikeRealList) return 'shopping';
@@ -1061,4 +1082,3 @@ app.post('/chat', async (req,res)=>{
 app.get('/health', (_,res)=>res.json({ ok:true }));
 const port = PORT || process.env.PORT || 3000;
 app.listen(port, ()=>console.log('ML Chat server on :'+port));
-
