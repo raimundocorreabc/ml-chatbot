@@ -1,5 +1,5 @@
 // server.js — IA-first + catálogo/brands/envíos/regiones/shopping-list + IA→keywords→Shopify + STOCK
-// (mejorado: título primero, "cocina" preciso, WC desodorante, intent stock menos agresivo, cookware/ollas y fallback a descripción)
+// (mejorado: vendor en minúsculas y fallback por descripción con exclusiones + whitelist de superficies)
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
@@ -78,10 +78,11 @@ async function searchProductsPlain(query, first = 5){
     }
   `,{ q: query, n: first });
   return (d.search?.edges||[]).map(e=>({
-    title:e.node.title,
-    handle:e.node.handle,
+    title: e.node.title,
+    handle: e.node.handle,
     availableForSale: !!e.node.availableForSale,
-    vendor: e.node.vendor || ''
+    // ✅ vendor normalizado en minúsculas para comparaciones coherentes
+    vendor: (e.node.vendor || '').toLowerCase()
   }));
 }
 
@@ -209,14 +210,53 @@ function splitShopping(text=''){
   return base.split(/,|\by\b/gi).map(s=>s.trim()).filter(Boolean);
 }
 
-// Queries dirigidas a la descripción (body:)
+/* ---------- EXCLUSIONES para Fallback por descripción (body:) ---------- */
+// Lista amplia de conectores/marketing/unidades/e-commerce (evita ruido en body:)
+const BODY_EXCLUDE = new Set([
+  // funcionales y conectores
+  'el','la','los','las','un','una','unos','unas','de','del','al','a','en','con','por','para','sin','sobre','entre','tras','desde','hasta','hacia',
+  'y','e','o','u','ni','que','como','donde','cuando','cual','cuales','cuyo','cuya','cuyos','cuyas',
+  'este','esta','estos','estas','ese','esa','esos','esas','aquel','aquella','aquellos','aquellas',
+  'lo','le','les','se','me','te','nos','os','su','sus','mi','mis','tu','tus','nuestro','nuestra','nuestros','nuestras',
+  'si','no','ya','aun','aún','tambien','también','ademas','mas','más','menos','muy','quiza','quizas','tal','tan','tanto',
+  // instrucciones/uso y marketing
+  'uso','usar','utilizar','empleo','metodo','método','modo','forma','manera','paso','pasos','guia','guía',
+  'instruccion','instrucción','instrucciones','indicado','indicada','indicados','recomendacion','recomendación','recomendado','recomendada',
+  'sirve','servir','ayuda','ayudar','permite','permitir','aplicar','aplicacion','aplicación','aplicado','aplicada',
+  'agitar','verter','diluir','enjuagar','enjuague','secar','frotar','rociar','pulverizar','repetir','dejar','esperar',
+  'mejor','eficaz','efectivo','eficiente','potente','rapido','rápido','seguro','confiable','durable','duradero','resistente',
+  'profesional','avanzado','original','nuevo','nueva','innovador','innovadora','superior','alto','alta','maxima','máxima',
+  'optimo','óptimo','optima','óptima','excelente','ideal','especial','adecuado','adecuada','versatil','versátil','facil','fácil','practico','práctico',
+  // genéricas del rubro (dejamos fuera superficies)
+  'limpieza','limpiar','aseo','hogar','casa','superficie','superficies',
+  'producto','productos','solucion','solución','formula','fórmula','contenido','contiene',
+  'elimina','remueve','quita','protege','cuida','actua','actúa','reduce','previene',
+  // unidades / cantidades / formatos
+  'ml','l','lt','litro','litros','g','gr','kg','kilo','kilos','oz','onzas',
+  'cm','mm','m','unidad','unidades','pack','set','formato','tamaño','tamano','presentacion','presentación',
+  'x','por','c/u','cu','aprox','aprox.','1','2','3','4','5','6','7','8','9','0',
+  '250','300','355','400','500','650','700','710','750','946','950','1000','3780','3.78',
+  // e-commerce / operativas
+  'oferta','promo','promoción','promocion','descuento','rebaja','precio','precios','normal','ahora',
+  'envio','envío','despacho','stock','disponible','disponibilidad','garantia','garantía',
+  'caja','cajas','codigo','código','sku','ref','referencia',
+  // relleno
+  'hecho','fabricado','fabricada','desarrollado','desarrollada','diseñado','diseñada','compatible',
+  'diario','cotidiano','multiuso','multi-uso','multiusos','multi-usos','domestico','doméstico','industrial'
+]);
+
+// Palabras que NUNCA se excluyen (son superficies/objetos clave)
+const BODY_WHITELIST = new Set([
+  'cocina','baño','bano','wc','olla','ollas','sarten','sartén','sartenes','cacerola',
+  'acero','inox','vidrio','alfombra','piso','pisos','madera','ropa'
+]);
+
+/* ----- Queries dirigidas a la descripción (body:) con exclusiones ----- */
 function bodyQueriesFromText(text=''){
-  const toks = tokenClean(text).filter(t => !GENERIC_TOKENS.has(t));
-  const qs = [];
-  if (toks.length){
-    qs.push(toks.map(t => `body:${t}`).join(' '));
-    for (const t of toks) qs.push(`body:${t}`);
-  }
+  const raw = tokenClean(text);
+  const tokens = raw.filter(t => (!BODY_EXCLUDE.has(t) || BODY_WHITELIST.has(t)) && !/^\d+(?:[.,]\d+)?$/.test(t));
+  if (!tokens.length) return [];
+  const qs = [ tokens.map(t => `body:${t}`).join(' ') , ...tokens.map(t => `body:${t}`) ];
   const phrase = String(text||'').trim();
   if (phrase.length >= 6) qs.push(`body:"${phrase.slice(0,100)}"`);
   const seen = new Set(); const out = [];
@@ -228,7 +268,7 @@ function bodyQueriesFromText(text=''){
   return out;
 }
 
-// Construcción de queries “de precisión” para un segmento
+/* ----- Construcción de queries “de precisión” para un segmento ----- */
 function buildPreciseQueriesForSegment(phrase){
   const q = phrase.trim();
   const nq = norm(q);
@@ -272,7 +312,7 @@ function buildPreciseQueriesForSegment(phrase){
     }
   }
 
-  // 4bis) si es desodorante/neutralizador WC, reforzar búsquedas
+  // 4) si es desodorante/neutralizador WC, reforzar búsquedas
   if (isWCDeo) {
     const wcSyns = [
       'desodorante wc','neutralizador wc','neutralizador olores wc','spray wc','aromatizante wc',
@@ -287,7 +327,7 @@ function buildPreciseQueriesForSegment(phrase){
     }
   }
 
-  // 4ter) si es cookware (ollas/sartenes)
+  // 5) cookware (ollas/sartenes)
   if (isCookware) {
     const cw = [
       'pasta multiuso','pink stuff pasta',
@@ -309,7 +349,7 @@ function buildPreciseQueriesForSegment(phrase){
     }
   }
 
-  // 5) Respaldo: tokens útiles (sin genéricos)
+  // 6) Respaldo: tokens útiles (sin genéricos)
   const tokens = tokenize(q).filter(t => t.length>=3 && !['limpiar','limpieza','limpiador','especialista','de','para'].includes(t));
   if (tokens.length){
     queries.push(tokens.join(' '));
@@ -331,7 +371,6 @@ async function bestMatchForPhrase(phrase){
   const p = phrase.toLowerCase().trim();
   const syn = SHOPPING_SYNONYMS[p] || [p];
 
-  // Precise-first strategy
   const { queries: precise, brand, isCocina, isWCDeo, isCookware } = buildPreciseQueriesForSegment(phrase);
 
   const pool=[]; const seen=new Set();
@@ -345,10 +384,10 @@ async function bestMatchForPhrase(phrase){
     }
   }
 
-  // 1) primero: consultas precisas
+  // 1) consultas precisas
   for (const q of precise) { await addBy(q, 12); if (pool.length>=18) break; }
 
-  // 2) luego: syn clásicos (fallback suave)
+  // 2) syn clásicos (fallback suave)
   if (pool.length < 6) {
     for (const q of syn){ await addBy(q, 10); if (pool.length>=18) break; }
   }
@@ -362,7 +401,7 @@ async function bestMatchForPhrase(phrase){
     }
   }
 
-  // 3bis) ÚLTIMO recurso: buscar por descripción (body:)
+  // 4) ÚLTIMO recurso: por descripción (body:) con exclusión de ruido
   if (!pool.length) {
     const bqs = bodyQueriesFromText(phrase);
     for (const q of bqs){
@@ -400,7 +439,7 @@ async function bestMatchForPhrase(phrase){
     if (isCocina && /cocina/i.test(x.title||'')) bonus += 2;
     if (isWCDeo && /wc|neutralizador|aromatizante|spray|olores/i.test(x.title||'')) bonus += 3;
     if (isCookware && /(olla|cacerol|sart[eé]n|sartenes|acero inoxidable|cookware)/i.test(x.title||'')) bonus += 3;
-    if (brand && (x.vendor||'').toLowerCase().includes(brand)) bonus += 2;
+    if (brand && (x.vendor||'').includes(brand)) bonus += 2;
     if (/\bdejapoo\b/.test(norm(phrase)) && /\bdejapoo\b/i.test(x.title||'')) bonus += 2;
     return { ...x, _bonus: bonus };
   }).sort((a,b)=>{
@@ -622,7 +661,7 @@ async function recommendByTitleFirst(userText, max=6){
     const fallback = await titleMatchProducts(userText, max);
     if (fallback && fallback.length) return fallback;
 
-    // Fallback 2: descripción (body:)
+    // Fallback 2: descripción (body:) con exclusiones
     const bqs = bodyQueriesFromText(userText);
     const seen = new Set(); const bodyPool = [];
     for (const q of bqs){
@@ -1036,7 +1075,8 @@ app.post('/chat', async (req,res)=>{
         ['LAVADO DE ROPA',  `${BASE}/search?q=ropa`],
         ['CUIDADO PERSONAL',`${BASE}/search?q=personal`],
         ['COCINA',          `${BASE}/search?q=cocina`],
-        ['BAÑO',            `${BASE}/search?q=ba% C3% B1o`.replace(/\s/g,'')],
+        // ✅ enlace corregido sin espacios
+        ['BAÑO',            `${BASE}/search?q=ba%C3%B1o`],
         ['PISOS',           `${BASE}/search?q=pisos`],
       ];
       const payload = fallback.map(([t,u])=>`${t}|${u}`).join('\n');
@@ -1131,7 +1171,7 @@ app.post('/chat', async (req,res)=>{
           ];
           for (const q of qs){
             const found = await searchProductsPlain(q, 8).catch(()=>[]);
-            const cleaned = (found||[]).filter(p=>!/piso|pisos|m[aá]rmol|parquet|bbq|parrilla|grill/i.test(p.title||''));
+            const cleaned = (found||[]).filter(p=>!/piso|pisos|m[aá]rmol|parquet|bbq|parrilla|grill/i.test(p.title||'')); // evita pisos/BBQ
             pool.push(...cleaned);
           }
           const ranked = pool.map(x=>{
@@ -1213,3 +1253,4 @@ app.post('/chat', async (req,res)=>{
 app.get('/health', (_,res)=>res.json({ ok:true }));
 const port = PORT || process.env.PORT || 3000;
 app.listen(port, ()=>console.log('ML Chat server on :'+port));
+
