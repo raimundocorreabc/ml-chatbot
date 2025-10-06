@@ -1,4 +1,4 @@
-// server.js — Chat tienda limpieza (Chile) | título-primero + fallback descripción (exclusiones) + cocina/WC/ollas + stock suave
+// server.js — Chat tienda limpieza (Chile) | título-primero + re-ranker (title+tags+type+desc+vendor) + fallback descripción (exclusiones) + cocina/WC/ollas + stock suave
 import 'dotenv/config'; import express from 'express'; import cors from 'cors'; import OpenAI from 'openai';
 
 const {
@@ -37,11 +37,28 @@ async function listCollections(n=10){
   const d=await gql(`query($n:Int!){collections(first:$n){edges{node{title handle}}}}`,{n});
   return (d.collections?.edges||[]).map(e=>({title:e.node.title,handle:e.node.handle}));
 }
-async function searchProductsPlain(query,first=5){
-  const d=await gql(`query($q:String!,$n:Int!){
-    search(query:$q,types:PRODUCT,first:$n){edges{node{... on Product{title handle availableForSale vendor}}}}
-  }`,{q:query,n:first});
-  return (d.search?.edges||[]).map(e=>({title:e.node.title,handle:e.node.handle,availableForSale:!!e.node.availableForSale,vendor:(e.node.vendor||'').toLowerCase()}));
+async function searchProductsPlain(query, first = 5){
+  const d = await gql(`
+    query($q:String!,$n:Int!){
+      search(query:$q, types: PRODUCT, first:$n){
+        edges{ node{ ... on Product {
+          title handle availableForSale vendor
+          productType tags
+          description
+        } } }
+      }
+    }
+  `,{ q: query, n: first });
+
+  return (d.search?.edges||[]).map(e=>({
+    title: e.node.title,
+    handle: e.node.handle,
+    availableForSale: !!e.node.availableForSale,
+    vendor: (e.node.vendor || '').toLowerCase(),
+    productType: e.node.productType || '',
+    tags: Array.isArray(e.node.tags) ? e.node.tags : [],
+    description: e.node.description || ''
+  }));
 }
 async function listTopSellers(n=8){
   const h=(BEST_SELLERS_COLLECTION_HANDLE||'').trim();
@@ -107,23 +124,42 @@ const splitShopping=t=>{const base=t.split(':').slice(1).join(':')||t; return ba
 
 /* ==== Descripción (body:) exclusiones/whitelist ==== */
 const BODY_EXCLUDE=mapSet([
-  // funcionales/conectores + uso/marketing + genéricas + unidades + ecom + relleno (compactado)
   'el,la,los,las,un,una,unos,unas,de,del,al,a,en,con,por,para,sin,sobre,entre,tras,desde,hasta,hacia,y,e,o,u,ni,que,como,donde,cuando,cual,cuales,cuyo,cuya,cuyos,cuyas,este,esta,estos,estas,ese,esa,esos,esas,aquel,aquella,aquellos,aquellas,lo,le,les,se,me,te,nos,os,su,sus,mi,mis,tu,tus,nuestro,nuestra,nuestros,nuestras,si,no,ya,aun,aún,tambien,también,ademas,mas,más,menos,muy,quiza,quizas,tal,tan,tanto,uso,usar,utilizar,empleo,metodo,método,modo,forma,manera,paso,pasos,guia,guía,instruccion,instrucción,instrucciones,indicado,indicada,indicados,recomendacion,recomendación,recomendado,recomendada,sirve,servir,ayuda,ayudar,permite,permitir,aplicar,aplicacion,aplicación,aplicado,aplicada,agitar,verter,diluir,enjuagar,enjuague,secar,frotar,rociar,pulverizar,repetir,dejar,esperar,mejor,eficaz,efectivo,eficiente,potente,rapido,rápido,seguro,confiable,durable,duradero,resistente,profesional,avanzado,original,nuevo,nueva,innovador,innovadora,superior,alto,alta,maxima,máxima,optimo,óptimo,optima,óptima,excelente,ideal,especial,adecuado,adecuada,versatil,versátil,facil,fácil,practico,práctico,limpieza,limpiar,aseo,hogar,casa,superficie,superficies,producto,productos,solucion,solución,formula,fórmula,contenido,contiene,elimina,remueve,quita,protege,cuida,actua,actúa,reduce,previene,ml,l,lt,litro,litros,g,gr,kg,kilo,kilos,oz,onzas,cm,mm,m,unidad,unidades,pack,set,formato,tamaño,tamano,presentacion,presentación,x,por,c/u,cu,aprox,1,2,3,4,5,6,7,8,9,0,250,300,355,400,500,650,700,710,750,946,950,1000,3780,3.78,oferta,promo,promoción,promocion,descuento,rebaja,precio,precios,normal,ahora,envio,envío,despacho,stock,disponible,disponibilidad,garantia,garantía,caja,cajas,codigo,código,sku,ref,referencia,hecho,fabricado,fabricada,desarrollado,desarrollada,diseñado,diseñada,compatible,diario,cotidiano,multiuso,multi-uso,multiusos,multi-usos,domestico,doméstico,industrial'
 ].join(','));
 const BODY_WHITELIST=mapSet('cocina,baño,bano,wc,olla,ollas,sarten,sartén,sartenes,cacerola,acero,inox,vidrio,alfombra,piso,pisos,madera,ropa');
 
 function tokenClean(s=''){ return tokenize(s).map(t=>t.replace(/s$/,'')).filter(t=>t.length>=3 && !STOPWORDS.has(t)); }
 const GENERIC_TOKENS=new Set(['limpiar','limpieza','limpiador','limpiadores']);
-const STOPWORDS=new Set('la,el,los,las,de,del,para,por,con,y,o,u,un,una,unos,unas,al,en,mi,tu,su,sus,que,qué,como,cómo,quiero,necesito,recomiendas,recomendar,limpiar,limpieza,mucho,poco,tengo,hay,me,mi'.split(',').map(norm));
+const STOPWORDS=new Set('la,el,los,las,de,del,para,por,con,y,o,u,un,una,unos,unas,al,en,mi,tu,su,sus,que,qué,como,cómo,quiero,necesito,recomiendas,recomendar,limpiar,limpieza,mucho,poco,tengo,hay,me,mi,algo'.split(',').map(norm)); // + 'algo'
 
-/* ==== body queries ==== */
+/* ==== body queries (con fallback tokens planos) ==== */
 function bodyQueriesFromText(text=''){
-  const raw=tokenClean(text);
-  const toks=raw.filter(t=>(!BODY_EXCLUDE.has(t)||BODY_WHITELIST.has(t)) && !/^\d+(?:[.,]\d+)?$/.test(t));
-  if(!toks.length) return [];
-  const qs=[ toks.map(t=>`body:${t}`).join(' '), ...toks.map(t=>`body:${t}`) ];
-  const phrase=String(text||'').trim(); if(phrase.length>=6) qs.push(`body:"${phrase.slice(0,100)}"`);
-  const out=[]; const seen=new Set(); for(const q of qs){ const k=q.trim(); if(!k||seen.has(k)) continue; seen.add(k); out.push(k); if(out.length>=10) break; }
+  const raw = tokenClean(text);
+  const toks = raw.filter(t => (!BODY_EXCLUDE.has(t) || BODY_WHITELIST.has(t)) && !/^\d+(?:[.,]\d+)?$/.test(t));
+  if (!toks.length) return [];
+  const qs = [];
+
+  // 1) consultas dirigidas a descripción
+  qs.push(toks.map(t => `body:${t}`).join(' '));
+  for (const t of toks) qs.push(`body:${t}`);
+
+  // 2) fallback con las mismas palabras como búsqueda normal (por si body: no está indexado)
+  qs.push(toks.join(' '));
+  for (const t of toks) qs.push(t);
+
+  // 3) frase entre comillas
+  const phrase = String(text||'').trim();
+  if (phrase.length >= 6) {
+    qs.push(`body:"${phrase.slice(0,100)}"`);
+    qs.push(`"${phrase.slice(0,100)}"`);
+  }
+
+  const out=[]; const seen=new Set();
+  for (const q of qs){
+    const k=q.trim(); if(!k||seen.has(k)) continue;
+    seen.add(k); out.push(k);
+    if(out.length>=12) break;
+  }
   return out;
 }
 
@@ -163,33 +199,57 @@ function makeQueriesFromText(text=''){
   const res=[]; const seen=new Set(); for(const q of out){ const k=String(q||'').trim(); if(!k||seen.has(k)) continue; seen.add(k); res.push(k); if(res.length>=12) break; }
   return res.length?res:[String(text||'').slice(0,120)];
 }
-async function buildPoolByQueries(queries,cap=72){const pool=[],seen=new Set();
+async function buildPoolByQueries(queries,cap=90){const pool=[],seen=new Set();
   for(const q of queries){ const found=await searchProductsPlain(q,18).catch(()=>[]); for(const it of found){ if(seen.has(it.handle)) continue; seen.add(it.handle); pool.push(it); if(pool.length>=cap) return pool; } }
   return pool;
 }
 
-/* ==== Scoring título ==== */
-function scoreTitleStrict(userText,title){
-  const u=tokenClean(userText), t=tokenClean(title), uSet=new Set(u), tSet=new Set(t);
-  const hits=[...uSet].reduce((n,x)=>n+(tSet.has(x)?1:0),0);
-  const jacc=(()=>{const inter=[...uSet].filter(x=>tSet.has(x)).length; const uni=new Set([...uSet,...tSet]).size||1; return inter/uni;})();
-  const s=detectSurface(userText||''), penalty=clashPenalty(s,title);
-  let surfaceBonus=0; if(s==='ollas' && /(olla|cacerol|sart[eé]n|sartenes|cookware|acero inoxidable)/i.test(title||'')) surfaceBonus+=2;
-  return {hits,jacc,score:(hits*3)+(jacc*1.2)+penalty+surfaceBonus};
-}
+/* ==== Re-ranker (usa título + tags + tipo + descripción + vendor + superficie + stock) ==== */
+function countHits(tokens=[], text=''){ const t=norm(text); let n=0; for(const tok of tokens){ if(tok && t.includes(tok)) n++; } return n; }
+function relevanceScore(userText, p){
+  const uq = tokenClean(userText).filter(t => !GENERIC_TOKENS.has(t));
+  const surface = detectSurface(userText);
 
-/* ==== Título primero ==== */
+  const title = norm(p.title||'');
+  const vendor = norm(p.vendor||'');
+  const type  = norm(p.productType||'');
+  const tagsT = norm((p.tags||[]).join(' '));
+  const desc  = norm(p.description||'');
+  const whole = `${title} ${tagsT} ${type} ${vendor} ${desc}`;
+
+  const titleHits = countHits(uq, title);
+  const tagHits   = countHits(uq, tagsT);
+  const typeHit   = countHits(uq, type);
+  const vendHit   = countHits(uq, vendor);
+  const descHits  = countHits(uq, desc);
+
+  const phrase = norm(String(userText||'').trim());
+  const phraseBonus = (phrase.length>=6 && (title.includes(phrase) || desc.includes(phrase))) ? 3 : 0;
+
+  const surfaceBoost = surface ? countHits(surfaceQueryBoost(surface).map(norm), whole) : 0;
+  const penalty = clashPenalty(surface, title) + clashPenalty(surface, tagsT);
+  const stockBoost = p.availableForSale ? 1.0 : 0;
+
+  return (titleHits*4) + (tagHits*3) + (typeHit*1.5) + (vendHit*1.5) + (descHits*1.2)
+         + phraseBonus + surfaceBoost + stockBoost + penalty;
+}
 async function recommendByTitleFirst(userText,max=6){
-  const pool=await buildPoolByQueries(makeQueriesFromText(userText),72); if(!pool.length) return [];
-  const scored=pool.map(p=>{const {hits,jacc,score}=scoreTitleStrict(userText,p.title||''); return {...p,_hits:hits,_jacc:jacc,_score:score};});
-  let cand=scored.filter(x=>x._hits>0); if(!cand.length) cand=scored.filter(x=>x._jacc>0);
-  if(!cand.length){
-    const fb=await titleMatchProducts(userText,max); if(fb?.length) return fb;
-    const bqs=bodyQueriesFromText(userText), seen=new Set(), body=[]; for(const q of bqs){ const f=await searchProductsPlain(q,18).catch(()=>[]); for(const it of f){ if(seen.has(it.handle)) continue; seen.add(it.handle); body.push(it); if(body.length>=36) break; } if(body.length>=36) break; }
-    return body.length?body.sort((a,b)=>a.availableForSale!==b.availableForSale?(a.availableForSale?-1:1):0).slice(0,max):[];
+  const pool=await buildPoolByQueries(makeQueriesFromText(userText),90); if(!pool.length) return [];
+  const scored=pool.map(p=>({...p,_score:relevanceScore(userText,p)}));
+  scored.sort((a,b)=>a.availableForSale!==b.availableForSale?(a.availableForSale?-1:1):b._score-a._score);
+
+  // Si la señal es muy baja, intentamos una pasada literal para mayor recall
+  const top=scored.slice(0,max);
+  if(top.every(x=>x._score<=0)){
+    const literal=String(userText||'').trim();
+    if(literal.length>=4){
+      const extra=await searchProductsPlain(`"${literal.slice(0,100)}"`,18).catch(()=>[]);
+      const merged=[...scored,...extra.map(p=>({...p,_score:relevanceScore(userText,p)}))];
+      merged.sort((a,b)=>a.availableForSale!==b.availableForSale?(a.availableForSale?-1:1):b._score-a._score);
+      return merged.slice(0,max);
+    }
   }
-  cand.sort((a,b)=>a.availableForSale!==b.availableForSale?(a.availableForSale?-1:1): a._hits!==b._hits?b._hits-a._hits : b._score-a._score);
-  return cand.slice(0,max);
+  return top;
 }
 
 /* ==== Fallbacks adicionales ==== */
