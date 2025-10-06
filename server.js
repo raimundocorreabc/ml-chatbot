@@ -201,7 +201,7 @@ const tokenize = s => norm(s).replace(/[^a-z0-9\s]/g,' ').split(/\s+/).filter(Bo
 
 const STOPWORDS = new Set([
   'la','el','los','las','de','del','para','por','con','y','o','u','un','una','unos','unas','al','en','mi','tu','su','sus',
-  'que','qué','como','cómo','quiero','necesito','recomiendas','recomendar','limpiar','limpieza','mucho','poco','tengo','hay','me','mi','algo'
+  'que','qué','como','cómo','quiero','necesito','recomiendas','recomendar','limpiar','limpieza','mucho','poco','tengo','hay','me','mi','algo','casa','hogar'
 ].map(norm));
 
 const GENERIC_TOKENS = new Set(['limpiar','limpieza','limpiadores','spray','gatillo']);
