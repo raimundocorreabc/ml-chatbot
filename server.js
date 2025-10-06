@@ -204,7 +204,7 @@ const STOPWORDS = new Set([
   'que','qué','como','cómo','quiero','necesito','recomiendas','recomendar','limpiar','limpieza','mucho','poco','tengo','hay','me','mi','algo'
 ].map(norm));
 
-const GENERIC_TOKENS = new Set(['limpiar','limpieza','limpiador','limpiadores','especialista','spray','gatillo']);
+const GENERIC_TOKENS = new Set(['limpiar','limpieza','limpiadores','spray','gatillo']);
 
 function tokenClean(s=''){
   return tokenize(s)
