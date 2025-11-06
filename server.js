@@ -204,6 +204,9 @@ const KNOWN_BRANDS = [
 
 const GENERIC_TOKENS = new Set(['limpiar','limpieza','especialista','spray','gatillo','hogar','casa'].map(norm));
 
+const SHORT_TOKENS_WHITELIST = new Set(['wc','ph','kh7','3en1', '3 en 1','pc'].map(norm));
+
+
 /* ---------- Token helpers (stemming simétrico) ---------- */
 function singularize(w){ return w.replace(/(?:es|s)$/,''); }
 
@@ -213,7 +216,7 @@ function tokenClean(s=''){
     .split(/\s+/)
     .filter(Boolean)
     .map(singularize)
-    .filter(t=>t.length>=3 && !STOPWORDS.has(t));
+    .filter(t => (t.length >= 3 || SHORT_TOKENS_WHITELIST.has(t)) && !STOPWORDS.has(t));
 }
 
 function wordSet(s){
