@@ -237,7 +237,7 @@ const STOPWORDS = new Set([
   'la','el','los','las','de','del','para','por','con','y','o','u','un','una','unos','unas',
   'al','en','mi','tu','su','sus','que','qué','como','cómo','quiero','necesito',
   'recomiendas','recomendar','limpieza','limpiar','mucho','poco','tengo','hay',
-  'me','mi','algo','hogar','casa'
+  'me','mi','algo','hogar','casa', 'producto','productos'
 ].map(norm));
 
 function tokenize(s){ return tokenClean(s); }
