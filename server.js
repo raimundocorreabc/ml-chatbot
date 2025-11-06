@@ -204,7 +204,7 @@ const KNOWN_BRANDS = [
 
 const GENERIC_TOKENS = new Set(['limpiar','limpieza','especialista','spray','gatillo','hogar','casa'].map(norm));
 
-const SHORT_TOKENS_WHITELIST = new Set(['wc','ph','kh7','3en1', '3 en 1','pc'].map(norm));
+const SHORT_TOKENS_WHITELIST = new Set(['wc','ph','kh7','3en1', '3 en 1','pc','tv'].map(norm));
 
 
 /* ---------- Token helpers (stemming simétrico) ---------- */
