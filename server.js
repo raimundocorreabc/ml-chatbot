@@ -46,32 +46,32 @@ const SF_API_VERSION = '2025-01';
 const BASE = (SHOPIFY_PUBLIC_STORE_DOMAIN || '').replace(/\/$/, '');
 const FREE_TH_DEFAULT = 40000;
 
-const norm = s => String(s||'').normalize('NFD').replace(/[\u0300-\u036f]/g,'').toLowerCase();
-const fold = s => norm(s).replace(/ñ/g,'n');
-const fmtCLP = n => new Intl.NumberFormat('es-CL',{style:'currency',currency:'CLP',maximumFractionDigits:0}).format(Math.round(Number(n)||0));
+const norm = s => String(s || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
+const fold = s => norm(s).replace(/ñ/g, 'n');
+const fmtCLP = n => new Intl.NumberFormat('es-CL', { style: 'currency', currency: 'CLP', maximumFractionDigits: 0 }).format(Math.round(Number(n) || 0));
 
 async function gql(query, variables = {}) {
   const url = `https://${SHOPIFY_STORE_DOMAIN}/api/${SF_API_VERSION}/graphql.json`;
   const r = await fetch(url, {
     method: 'POST',
-    headers: {'Content-Type':'application/json', 'X-Shopify-Storefront-Access-Token': SHOPIFY_STOREFRONT_TOKEN},
+    headers: { 'Content-Type': 'application/json', 'X-Shopify-Storefront-Access-Token': SHOPIFY_STOREFRONT_TOKEN },
     body: JSON.stringify({ query, variables })
   });
-  if (!r.ok) throw new Error('Storefront API '+r.status);
+  if (!r.ok) throw new Error('Storefront API ' + r.status);
   const data = await r.json();
   if (data.errors) throw new Error(JSON.stringify(data.errors));
   return data.data;
 }
 
 /* ----- Catálogo helpers ----- */
-async function listCollections(limit = 10){
+async function listCollections(limit = 10) {
   const d = await gql(`
     query($n:Int!){ collections(first:$n){ edges{ node{ title handle } } } }
-  `,{ n: limit });
-  return (d.collections?.edges||[]).map(e=>({ title:e.node.title, handle:e.node.handle }));
+  `, { n: limit });
+  return (d.collections?.edges || []).map(e => ({ title: e.node.title, handle: e.node.handle }));
 }
 
-async function searchProductsPlain(query, first = 5){
+async function searchProductsPlain(query, first = 5) {
   // Pedimos vendor, productType, tags y description para poder puntuar por "descripción"
   const d = await gql(`
     query($q:String!,$n:Int!){
@@ -83,22 +83,22 @@ async function searchProductsPlain(query, first = 5){
         } }
       }
     }
-  `,{ q: query, n: first });
-  return (d.search?.edges||[]).map(e=>({
-    title:e.node.title,
-    handle:e.node.handle,
+  `, { q: query, n: first });
+  return (d.search?.edges || []).map(e => ({
+    title: e.node.title,
+    handle: e.node.handle,
     availableForSale: !!e.node.availableForSale,
     vendor: e.node.vendor || '',
     productType: e.node.productType || '',
-    tags: Array.isArray(e.node.tags)?e.node.tags:[],
+    tags: Array.isArray(e.node.tags) ? e.node.tags : [],
     description: e.node.description || ''
   }));
 }
 
-async function listTopSellers(first = 8){
-  const handle = (BEST_SELLERS_COLLECTION_HANDLE||'').trim();
-  if (handle){
-    try{
+async function listTopSellers(first = 8) {
+  const handle = (BEST_SELLERS_COLLECTION_HANDLE || '').trim();
+  if (handle) {
+    try {
       const d = await gql(`
         query($h:String!,$n:Int!){
           collectionByHandle(handle:$h){
@@ -107,34 +107,34 @@ async function listTopSellers(first = 8){
             }
           }
         }
-      `,{ h: handle, n:first });
-      const items = (d.collectionByHandle?.products?.edges||[]).map(e=>({title:e.node.title,handle:e.node.handle,availableForSale:!!e.node.availableForSale}));
+      `, { h: handle, n: first });
+      const items = (d.collectionByHandle?.products?.edges || []).map(e => ({ title: e.node.title, handle: e.node.handle, availableForSale: !!e.node.availableForSale }));
       if (items.length) return items;
       console.warn('[tops] Colección vacía o inválida:', handle);
-    }catch(err){ console.warn('[tops] error colección', err?.message||err); }
+    } catch (err) { console.warn('[tops] error colección', err?.message || err); }
   }
-  try{
+  try {
     const d = await gql(`
       query($n:Int!){ products(first:$n, sortKey: BEST_SELLING){ edges{ node{ title handle availableForSale } } } }
-    `,{ n:first });
-    const items = (d.products?.edges||[]).map(e=>({title:e.node.title,handle:e.node.handle,availableForSale:!!e.node.availableForSale}));
+    `, { n: first });
+    const items = (d.products?.edges || []).map(e => ({ title: e.node.title, handle: e.node.handle, availableForSale: !!e.node.availableForSale }));
     if (items.length) return items;
-  }catch(err){ console.warn('[tops] error global', err?.message||err); }
-  const any = await gql(`query($n:Int!){ products(first:$n){ edges{ node{ title handle availableForSale } } } }`,{ n:first });
-  return (any.products?.edges||[]).map(e=>({title:e.node.title,handle:e.node.handle,availableForSale:!!e.node.availableForSale}));
+  } catch (err) { console.warn('[tops] error global', err?.message || err); }
+  const any = await gql(`query($n:Int!){ products(first:$n){ edges{ node{ title handle availableForSale } } } }`, { n: first });
+  return (any.products?.edges || []).map(e => ({ title: e.node.title, handle: e.node.handle, availableForSale: !!e.node.availableForSale }));
 }
 
-function buildProductsMarkdown(items=[]){
+function buildProductsMarkdown(items = []) {
   if (!items.length) return null;
-  const lines = items.map((p,i)=>`${i+1}. **[${(p.title||'Ver producto').replace(/\*/g,'')}](${BASE}/products/${p.handle})**`);
+  const lines = items.map((p, i) => `${i + 1}. **[${(p.title || 'Ver producto').replace(/\*/g, '')}](${BASE}/products/${p.handle})**`);
   return `Aquí tienes opciones:\n\n${lines.join('\n')}`;
 }
 
-async function preferInStock(items, need){
-  const inStock = items.filter(x=>x.availableForSale);
-  const rest    = items.filter(x=>!x.availableForSale);
+async function preferInStock(items, need) {
+  const inStock = items.filter(x => x.availableForSale);
+  const rest = items.filter(x => !x.availableForSale);
   const seen = new Set(); const out = [];
-  for (const it of [...inStock, ...rest]){
+  for (const it of [...inStock, ...rest]) {
     if (seen.has(it.handle)) continue;
     seen.add(it.handle);
     out.push(it);
@@ -145,91 +145,96 @@ async function preferInStock(items, need){
 
 /* ----- Shipping regiones/comunas + zonas ----- */
 const REGIONES_LIST = [
-  'Arica y Parinacota','Tarapacá','Antofagasta','Atacama',
-  'Coquimbo','Valparaíso',"O’Higgins","O'Higgins",'Maule','Ñuble','Biobío','Araucanía','Los Ríos','Los Lagos',
-  'Metropolitana','Santiago',
-  'Aysén','Magallanes'
+  'Arica y Parinacota', 'Tarapacá', 'Antofagasta', 'Atacama',
+  'Coquimbo', 'Valparaíso', "O’Higgins", "O'Higgins", 'Maule', 'Ñuble', 'Biobío', 'Araucanía', 'Los Ríos', 'Los Lagos',
+  'Metropolitana', 'Santiago',
+  'Aysén', 'Magallanes'
 ];
 const REGIONES_F = new Set(REGIONES_LIST.map(fold));
-const COMUNAS = ['Las Condes','Vitacura','Lo Barnechea','Providencia','Ñuñoa','La Reina','Santiago','Macul','La Florida','Puente Alto','Maipú','Maipu','Huechuraba','Independencia','Recoleta','Quilicura','Conchalí','Conchali','San Miguel','San Joaquín','San Joaquin','La Cisterna','San Bernardo','Colina','Buin','Lampa'];
+const COMUNAS = ['Las Condes', 'Vitacura', 'Lo Barnechea', 'Providencia', 'Ñuñoa', 'La Reina', 'Santiago', 'Macul', 'La Florida', 'Puente Alto', 'Maipú', 'Maipu', 'Huechuraba', 'Independencia', 'Recoleta', 'Quilicura', 'Conchalí', 'Conchali', 'San Miguel', 'San Joaquín', 'San Joaquin', 'La Cisterna', 'San Bernardo', 'Colina', 'Buin', 'Lampa'];
 const COMUNAS_F = new Set(COMUNAS.map(fold));
 
 const SHIPPING_ZONES = [
-  { zone:'REGIÓN METROPOLITANA', cost:3990,  regions:['Metropolitana','Santiago'] },
-  { zone:'ZONA CENTRAL',         cost:6990,  regions:['Coquimbo','Valparaíso','Valparaiso',"O’Higgins","O'Higgins",'Maule','Ñuble','Nuble','Biobío','Biobio','Araucanía','Araucania','Los Ríos','Los Rios','Los Lagos'] },
-  { zone:'ZONA NORTE',           cost:10990, regions:['Arica y Parinacota','Tarapacá','Tarapaca','Antofagasta','Atacama'] },
-  { zone:'ZONA AUSTRAL',         cost:14990, regions:['Aysén','Aysen','Magallanes'] }
+  { zone: 'REGIÓN METROPOLITANA', cost: 3990, regions: ['Metropolitana', 'Santiago'] },
+  { zone: 'ZONA CENTRAL', cost: 6990, regions: ['Coquimbo', 'Valparaíso', 'Valparaiso', "O’Higgins", "O'Higgins", 'Maule', 'Ñuble', 'Nuble', 'Biobío', 'Biobio', 'Araucanía', 'Araucania', 'Los Ríos', 'Los Rios', 'Los Lagos'] },
+  { zone: 'ZONA NORTE', cost: 10990, regions: ['Arica y Parinacota', 'Tarapacá', 'Tarapaca', 'Antofagasta', 'Atacama'] },
+  { zone: 'ZONA AUSTRAL', cost: 14990, regions: ['Aysén', 'Aysen', 'Magallanes'] }
 ];
-const REGION_COST_MAP = (()=>{ const m=new Map(); for(const z of SHIPPING_ZONES) for(const r of z.regions) m.set(fold(r),{zone:z.zone,cost:z.cost}); m.set('metropolitana',{zone:'REGIÓN METROPOLITANA',cost:3990}); m.set('santiago',{zone:'REGIÓN METROPOLITANA',cost:3990}); return m; })();
-const shippingByRegionName = (s='') => REGION_COST_MAP.get(fold(s)) || null;
+const REGION_COST_MAP = (() => {
+  const m = new Map();
+  for (const z of SHIPPING_ZONES) for (const r of z.regions) m.set(fold(r), { zone: z.zone, cost: z.cost });
+  m.set('metropolitana', { zone: 'REGIÓN METROPOLITANA', cost: 3990 });
+  m.set('santiago', { zone: 'REGIÓN METROPOLITANA', cost: 3990 });
+  return m;
+})();
+const shippingByRegionName = (s = '') => REGION_COST_MAP.get(fold(s)) || null;
 
-function regionsPayloadLines(){
-  const uniq = Array.from(new Set(REGIONES_LIST.map(r=>r.replace(/\"/g,''))));
+function regionsPayloadLines() {
+  const uniq = Array.from(new Set(REGIONES_LIST.map(r => r.replace(/\"/g, ''))));
   return uniq.map(r => `${r}|${r}`).join('\n');
 }
 
 /* ----- Shopping list (1 por ítem, mismo orden) ----- */
 const SHOPPING_SYNONYMS = {
-  'lavalozas': ['lavalozas','lava loza','lavaplatos','dishwashing','lavavajillas liquido','dawn','quix'],
-  'antigrasa': ['antigrasa','desengrasante','degreaser','kh-7','kh7'],
-  'multiuso':  ['multiuso','all purpose','limpiador multiuso','cif crema','pink stuff'],
-  'esponja':   ['esponja','fibra','sponge','scrub daddy'],
-  'parrillas': ['limpiador parrilla','bbq','grill','goo gone bbq','desengrasante parrilla'],
-  'piso':      ['limpiador pisos','floor cleaner','bona','lithofin'],
-  'alfombra':  ['limpiador alfombra','tapiceria','tapiz','dr beckmann'],
-  'vidrio':    ['limpia vidrios','glass cleaner','weiman glass'],
-  'acero':     ['limpiador acero inoxidable','weiman acero'],
-  'protector textil': ['protector textil','impermeabilizante telas','fabric protector'],
+  'lavalozas': ['lavalozas', 'lava loza', 'lavaplatos', 'dishwashing', 'lavavajillas liquido', 'dawn', 'quix'],
+  'antigrasa': ['antigrasa', 'desengrasante', 'degreaser', 'kh-7', 'kh7'],
+  'multiuso': ['multiuso', 'all purpose', 'limpiador multiuso', 'cif crema', 'pink stuff'],
+  'esponja': ['esponja', 'fibra', 'sponge', 'scrub daddy'],
+  'parrillas': ['limpiador parrilla', 'bbq', 'grill', 'goo gone bbq', 'desengrasante parrilla'],
+  'piso': ['limpiador pisos', 'floor cleaner', 'bona', 'lithofin'],
+  'alfombra': ['limpiador alfombra', 'tapiceria', 'tapiz', 'dr beckmann'],
+  'vidrio': ['limpia vidrios', 'glass cleaner', 'weiman glass'],
+  'acero': ['limpiador acero inoxidable', 'weiman acero'],
+  'protector textil': ['protector textil', 'impermeabilizante telas', 'fabric protector'],
   // Cocina fuerte
-  'cocina': ['limpiador cocina','limpiador de cocina','antigrasa cocina','desengrasante cocina'],
+  'cocina': ['limpiador cocina', 'limpiador de cocina', 'antigrasa cocina', 'desengrasante cocina'],
   // WC desodorante/neutralizador/aromatizante
-  'desodorante wc': ['desodorante wc','neutralizador wc','neutralizador olores wc','spray wc','aromatizante wc','desodorante baño wc','dejapoo'],
-  'desodorante baño': ['desodorante baño','aromatizante baño','spray baño','neutralizador olores baño','dejapoo'],
-  'neutralizador wc': ['neutralizador wc','neutralizador olores wc','desodorante wc','spray wc','dejapoo'],
+  'desodorante wc': ['desodorante wc', 'neutralizador wc', 'neutralizador olores wc', 'spray wc', 'aromatizante wc', 'desodorante baño wc', 'dejapoo'],
+  'desodorante baño': ['desodorante baño', 'aromatizante baño', 'spray baño', 'neutralizador olores baño', 'dejapoo'],
+  'neutralizador wc': ['neutralizador wc', 'neutralizador olores wc', 'desodorante wc', 'spray wc', 'dejapoo'],
   // Ollas / sartenes / cacerolas
   'ollas': [
-    'pasta multiuso','pink stuff pasta','desengrasante cocina','limpiador cocina',
-    'limpiador acero inoxidable','lavalozas','esponja','fibra','scrub daddy','sarten','cacerola','olla'
+    'pasta multiuso', 'pink stuff pasta', 'desengrasante cocina', 'limpiador cocina',
+    'limpiador acero inoxidable', 'lavalozas', 'esponja', 'fibra', 'scrub daddy', 'sarten', 'cacerola', 'olla'
   ],
   // Pods/cápsulas
-  'pods': ['pod','pods','capsula','capsulas','tab','tabs','pacs','3en1','3 en 1']
+  'pods': ['pod', 'pods', 'capsula', 'capsulas', 'tab', 'tabs', 'pacs', '3en1', '3 en 1']
 };
 
 // Marcas conocidas (para vendor:)
 const KNOWN_BRANDS = [
-  'astonish','weiman','goo gone','dr beckmann','dr. beckmann','kh7','kh-7','bona','lithofin',
-  'rexona','febreze','vileda','quix','dejapoo','the pink stuff','pink stuff',
-  'tide','ariel','arm & hammer','arm and hammer','arm&hammer','nova','elite'
+  'astonish', 'weiman', 'goo gone', 'dr beckmann', 'dr. beckmann', 'kh7', 'kh-7', 'bona', 'lithofin',
+  'rexona', 'febreze', 'vileda', 'quix', 'dejapoo', 'the pink stuff', 'pink stuff',
+  'tide', 'ariel', 'arm & hammer', 'arm and hammer', 'arm&hammer', 'nova', 'elite'
 ];
 
-const GENERIC_TOKENS = new Set(['limpiar','limpieza','especialista','spray','gatillo','hogar','casa'].map(norm));
+const GENERIC_TOKENS = new Set(['limpiar', 'limpieza', 'especialista', 'spray', 'gatillo', 'hogar', 'casa'].map(norm));
 
-const SHORT_TOKENS_WHITELIST = new Set(['wc','ph','kh7','3en1', '3 en 1','pc','tv'].map(norm));
-
+const SHORT_TOKENS_WHITELIST = new Set(['wc', 'ph', 'kh7', '3en1', '3 en 1', 'pc', 'tv'].map(norm));
 
 /* ---------- Token helpers (stemming simétrico) ---------- */
-function singularize(w){ return w.replace(/(?:es|s)$/,''); }
+function singularize(w) { return w.replace(/(?:es|s)$/, ''); }
 
-function tokenClean(s=''){
+function tokenClean(s = '') {
   return norm(s)
-    .replace(/[^a-z0-9\s]/g,' ')
+    .replace(/[^a-z0-9\s]/g, ' ')
     .split(/\s+/)
     .filter(Boolean)
     .map(singularize)
     .filter(t => (t.length >= 3 || SHORT_TOKENS_WHITELIST.has(t)) && !STOPWORDS.has(t));
 }
 
-function wordSet(s){
+function wordSet(s) {
   return new Set(
-    norm(s||'')
-      .replace(/[^a-z0-9\s]/g,' ')
+    norm(s || '')
+      .replace(/[^a-z0-9\s]/g, ' ')
       .split(/\s+/)
       .filter(Boolean)
       .map(singularize)
   );
 }
 
-function countHitsIn(text, tokens){
+function countHitsIn(text, tokens) {
   const set = wordSet(text);
   let n = 0;
   for (const t of tokens) if (set.has(t)) n++;
@@ -237,48 +242,48 @@ function countHitsIn(text, tokens){
 }
 
 const STOPWORDS = new Set([
-  'la','el','los','las','de','del','para','por','con','y','o','u','un','una','unos','unas',
-  'al','en','mi','tu','su','sus','que','qué','como','cómo','quiero','necesito',
-  'recomiendas','recomendar','limpieza','limpiar','mucho','poco','tengo','hay',
-  'me','mi','algo','hogar','casa', 'producto','productos'
+  'la', 'el', 'los', 'las', 'de', 'del', 'para', 'por', 'con', 'y', 'o', 'u', 'un', 'una', 'unos', 'unas',
+  'al', 'en', 'mi', 'tu', 'su', 'sus', 'que', 'qué', 'como', 'cómo', 'quiero', 'necesito',
+  'recomiendas', 'recomendar', 'limpieza', 'limpiar', 'mucho', 'poco', 'tengo', 'hay',
+  'me', 'mi', 'algo', 'hogar', 'casa', 'producto', 'productos'
 ].map(norm));
 
-function tokenize(s){ return tokenClean(s); }
+function tokenize(s) { return tokenClean(s); }
 
 // Expansión de sinónimos básicos (incluye pods/cápsulas, stickers/calcomanías, sarro/cal, moho/mildew, etc.)
 const BASIC_SYNONYMS = {
-  sticker: ['sticker','pegatina','calcomania','calcomanias','adhesivo','etiqueta'],
-  calcomania: ['calcomania','calcomanias','sticker','pegatina','adhesivo','etiqueta'],
-  sarro: ['sarro','cal','calcio'],
-  moho: ['moho','mildew','hongo','hongos','antihongos'],
-  cocina: ['cocina','desengrasante','antigrasa'],
-  wc: ['wc','baño','bano'],
+  sticker: ['sticker', 'pegatina', 'calcomania', 'calcomanias', 'adhesivo', 'etiqueta'],
+  calcomania: ['calcomania', 'calcomanias', 'sticker', 'pegatina', 'adhesivo', 'etiqueta'],
+  sarro: ['sarro', 'cal', 'calcio'],
+  moho: ['moho', 'mildew', 'hongo', 'hongos', 'antihongos'],
+  cocina: ['cocina', 'desengrasante', 'antigrasa'],
+  wc: ['wc', 'baño', 'bano'],
   pods: SHOPPING_SYNONYMS['pods']
 };
 
-function expandTokens(tokens){
+function expandTokens(tokens) {
   const out = new Set();
-  for (const t of tokens){
+  for (const t of tokens) {
     out.add(t);
-    for (const [k, syns] of Object.entries(BASIC_SYNONYMS)){
+    for (const [k, syns] of Object.entries(BASIC_SYNONYMS)) {
       if (t === k || syns.includes(t)) syns.forEach(s => out.add(singularize(norm(s))));
     }
   }
   return Array.from(out);
 }
 
-function compositeDescription(p){
+function compositeDescription(p) {
   const parts = [
-    p.description||'',
-    p.vendor||'',
-    p.productType||'',
+    p.description || '',
+    p.vendor || '',
+    p.productType || '',
     Array.isArray(p.tags) ? p.tags.join(' ') : ''
   ];
   return parts.join(' ');
 }
 
 /* ----- Superficies / áreas y penalizaciones por choque ----- */
-function detectSurface(text=''){
+function detectSurface(text = '') {
   const q = norm(text);
   if (/(\bbaño|\bbano|\bwc)\b/.test(q)) return 'bano';
   if (/(\bcocina)\b/.test(q)) return 'cocina';
@@ -293,61 +298,61 @@ function detectSurface(text=''){
   return null;
 }
 
-function surfaceQueryBoost(surface){
-  switch(surface){
-    case 'bano':    return ['limpiador baño','antihongos baño','quita sarro baño','desinfectante baño','wc'];
-    case 'cocina':  return ['desengrasante cocina','limpiador cocina','antigrasa cocina','acero inoxidable cocina'];
-    case 'alfombra':return ['limpiador alfombra','tapiceria','quitamanchas alfombra','dr beckmann'];
-    case 'pisos':   return ['limpiador pisos','bona','lithofin','abrillantador pisos'];
-    case 'vidrio':  return ['limpia vidrios','glass cleaner','antiempañante vidrio'];
-    case 'madera':  return ['limpiador madera','acondicionador madera','abrillantador madera'];
-    case 'acero':   return ['limpiador acero inoxidable','weiman acero','polish acero'];
-    case 'ropa':    return ['quitamanchas ropa','blanqueador ropa','detergente capsulas'];
-    case 'ollas':   return ['pasta multiuso','pink stuff pasta','desengrasante cocina','limpiador cocina','limpiador acero inoxidable','lavalozas','esponja','fibra','scrub daddy'];
-    case 'azulejos':return ['antihongos','mildew away','moho','limpiador juntas','limpiador azulejos','ceramica'];
-    default:        return [];
+function surfaceQueryBoost(surface) {
+  switch (surface) {
+    case 'bano': return ['limpiador baño', 'antihongos baño', 'quita sarro baño', 'desinfectante baño', 'wc'];
+    case 'cocina': return ['desengrasante cocina', 'limpiador cocina', 'antigrasa cocina', 'acero inoxidable cocina'];
+    case 'alfombra': return ['limpiador alfombra', 'tapiceria', 'quitamanchas alfombra', 'dr beckmann'];
+    case 'pisos': return ['limpiador pisos', 'bona', 'lithofin', 'abrillantador pisos'];
+    case 'vidrio': return ['limpia vidrios', 'glass cleaner', 'antiempañante vidrio'];
+    case 'madera': return ['limpiador madera', 'acondicionador madera', 'abrillantador madera'];
+    case 'acero': return ['limpiador acero inoxidable', 'weiman acero', 'polish acero'];
+    case 'ropa': return ['quitamanchas ropa', 'blanqueador ropa', 'detergente capsulas'];
+    case 'ollas': return ['pasta multiuso', 'pink stuff pasta', 'desengrasante cocina', 'limpiador cocina', 'limpiador acero inoxidable', 'lavalozas', 'esponja', 'fibra', 'scrub daddy'];
+    case 'azulejos': return ['antihongos', 'mildew away', 'moho', 'limpiador juntas', 'limpiador azulejos', 'ceramica'];
+    default: return [];
   }
 }
 
 const SURFACE_CLASH = {
-  bano:    ['madera','granito','vidrio','parquet'],
-  cocina:  ['baño','wc'],
-  alfombra:['madera','acero','vidrio'],
-  pisos:   ['alfombra','tapiz'],
-  vidrio:  ['madera','alfombra'],
-  madera:  ['baño','wc'],
-  acero:   ['madera','alfombra'],
-  ropa:    ['madera','parrilla','pisos']
+  bano: ['madera', 'granito', 'vidrio', 'parquet'],
+  cocina: ['baño', 'wc'],
+  alfombra: ['madera', 'acero', 'vidrio'],
+  pisos: ['alfombra', 'tapiz'],
+  vidrio: ['madera', 'alfombra'],
+  madera: ['baño', 'wc'],
+  acero: ['madera', 'alfombra'],
+  ropa: ['madera', 'parrilla', 'pisos']
 };
-function clashPenalty(userSurface, title=''){
+function clashPenalty(userSurface, title = '') {
   if (!userSurface) return 0;
   const t = norm(title);
   const clashes = SURFACE_CLASH[userSurface] || [];
   let penalty = 0;
-  for (const word of clashes){
+  for (const word of clashes) {
     if (t.includes(norm(word))) penalty -= 2;
   }
   return penalty;
 }
 
 /* ----- Query makers ----- */
-function splitShopping(text=''){
+function splitShopping(text = '') {
   const afterColon = text.split(':');
   const base = afterColon.length > 1 ? afterColon.slice(1).join(':') : text;
-  return base.split(/,|\by\b/gi).map(s=>s.trim()).filter(Boolean);
+  return base.split(/,|\by\b/gi).map(s => s.trim()).filter(Boolean);
 }
 
-function bodyQueriesFromText(text=''){
+function bodyQueriesFromText(text = '') {
   const toks = tokenClean(text).filter(t => !GENERIC_TOKENS.has(t));
   const qs = [];
-  if (toks.length){
+  if (toks.length) {
     qs.push(toks.map(t => `body:${t}`).join(' '));
     for (const t of toks) qs.push(`body:${t}`);
   }
-  const phrase = String(text||'').trim();
-  if (phrase.length >= 6) qs.push(`body:"${phrase.slice(0,100)}"`);
+  const phrase = String(text || '').trim();
+  if (phrase.length >= 6) qs.push(`body:"${phrase.slice(0, 100)}"`);
   const seen = new Set(); const out = [];
-  for (const q of qs){
+  for (const q of qs) {
     const k = q.trim(); if (!k || seen.has(k)) continue;
     seen.add(k); out.push(k);
     if (out.length >= 10) break;
@@ -356,22 +361,22 @@ function bodyQueriesFromText(text=''){
 }
 
 /* ===== Ranking core: título > descripción ===== */
-function scoreProductAgainstTokens(p, userText){
-  const surf = detectSurface(userText||'');
-  const baseTokens = tokenize(userText||'').filter(t => !GENERIC_TOKENS.has(t));
+function scoreProductAgainstTokens(p, userText) {
+  const surf = detectSurface(userText || '');
+  const baseTokens = tokenize(userText || '').filter(t => !GENERIC_TOKENS.has(t));
   const tokens = expandTokens(baseTokens);
 
   const title = p.title || '';
-  const desc  = compositeDescription(p);
+  const desc = compositeDescription(p);
 
   const th = countHitsIn(title, tokens);                // Title hits
-  const dh = countHitsIn(desc,  tokens);                // Description hits (desc+vendor+tags+ptype)
+  const dh = countHitsIn(desc, tokens);                 // Description hits (desc+vendor+tags+ptype)
   const pen = clashPenalty(surf, title);
 
   return { th, dh, pen };
 }
 
-function sortByTitleThenDesc(a, b){
+function sortByTitleThenDesc(a, b) {
   // disponibilidad primero
   if (a.availableForSale !== b.availableForSale) return a.availableForSale ? -1 : 1;
   // mayor coincidencia en TÍTULO
@@ -379,13 +384,13 @@ function sortByTitleThenDesc(a, b){
   // empate: mayor coincidencia en DESCRIPCIÓN
   if (a._dh !== b._dh) return b._dh - a._dh;
   // bonus (si existe)
-  if ((a._bn||0) !== (b._bn||0)) return (b._bn||0) - (a._bn||0);
+  if ((a._bn || 0) !== (b._bn || 0)) return (b._bn || 0) - (a._bn || 0);
   // desempate final: título más corto
-  return (a.title||'').length - (b.title||'').length;
+  return (a.title || '').length - (b.title || '').length;
 }
 
 /* ===== Estrategias de búsqueda ===== */
-function makeQueriesFromText(text=''){
+function makeQueriesFromText(text = '') {
   const toks = tokenClean(text);
   const queries = [];
 
@@ -396,7 +401,7 @@ function makeQueriesFromText(text=''){
   if (toks.length) {
     const joined = toks.filter(t => !GENERIC_TOKENS.has(t)).join(' ').trim();
     if (joined) queries.push(joined);
-    for (const t of toks){
+    for (const t of toks) {
       if (!GENERIC_TOKENS.has(t)) queries.push(t);
     }
   }
@@ -404,22 +409,22 @@ function makeQueriesFromText(text=''){
     if (norm(text).includes(norm(key))) queries.push(key);
   }
 
-  const seen=new Set(); const out=[];
+  const seen = new Set(); const out = [];
   for (const q of queries) {
-    const k = String(q||'').trim();
+    const k = String(q || '').trim();
     if (!k || seen.has(k)) continue;
     seen.add(k); out.push(k);
-    if (out.length>=12) break;
+    if (out.length >= 12) break;
   }
-  return out.length ? out : [String(text||'').slice(0,120)];
+  return out.length ? out : [String(text || '').slice(0, 120)];
 }
 
-async function buildPoolByQueries(queries, cap=72){
-  const pool=[]; const seen=new Set();
-  for (const q of queries){
-    const found = await searchProductsPlain(q, 18).catch(()=>[]);
-    for (const it of found){
-      if (!seen.has(it.handle)){
+async function buildPoolByQueries(queries, cap = 72) {
+  const pool = []; const seen = new Set();
+  for (const q of queries) {
+    const found = await searchProductsPlain(q, 18).catch(() => []);
+    for (const it of found) {
+      if (!seen.has(it.handle)) {
         seen.add(it.handle);
         pool.push(it);
         if (pool.length >= cap) return pool;
@@ -430,34 +435,34 @@ async function buildPoolByQueries(queries, cap=72){
 }
 
 /* ===== Shopping: un match por segmento (orden original) ===== */
-async function bestMatchForPhrase(phrase){
+async function bestMatchForPhrase(phrase) {
   const { queries } = buildPreciseQueriesForSegment(phrase);
   const nq = norm(phrase);
   const wantsCaps = /\b(pod|pods|capsula|capsulas|tab|tabs|pacs)\b/.test(nq);
 
-  const pool=[]; const seen=new Set();
-  async function addBy(q, n=12){
-    const found = await searchProductsPlain(q, n).catch(()=>[]);
-    for (const it of found){
-      if (!seen.has(it.handle)){
+  const pool = []; const seen = new Set();
+  async function addBy(q, n = 12) {
+    const found = await searchProductsPlain(q, n).catch(() => []);
+    for (const it of found) {
+      if (!seen.has(it.handle)) {
         seen.add(it.handle);
         pool.push(it);
       }
     }
   }
-  for (const q of queries) { await addBy(q, 12); if (pool.length>=24) break; }
+  for (const q of queries) { await addBy(q, 12); if (pool.length >= 24) break; }
   if (!pool.length) {
     const bqs = bodyQueriesFromText(phrase);
-    for (const q of bqs){ await addBy(q, 12); if (pool.length>=24) break; }
+    for (const q of bqs) { await addBy(q, 12); if (pool.length >= 24) break; }
   }
   if (!pool.length) return null;
 
   // Scoring: título > descripción (y bonus por cápsulas si aplica)
-  const scored = pool.map(p=>{
+  const scored = pool.map(p => {
     const { th, dh, pen } = scoreProductAgainstTokens(p, phrase);
     let bonus = -pen;
-    if (wantsCaps && /(pod|pods|capsula|capsulas|tab|tabs|pacs|3\s?en\s?1)/i.test(p.title||'')) bonus += 3;
-    if (wantsCaps && /\bliquido\b/i.test(p.title||'')) bonus -= 1;
+    if (wantsCaps && /(pod|pods|capsula|capsulas|tab|tabs|pacs|3\s?en\s?1)/i.test(p.title || '')) bonus += 3;
+    if (wantsCaps && /\bliquido\b/i.test(p.title || '')) bonus -= 1;
     return { ...p, _th: th, _dh: dh, _bn: bonus };
   });
 
@@ -466,19 +471,19 @@ async function bestMatchForPhrase(phrase){
 }
 
 // Construcción de queries “de precisión” por segmento (usa syns y surfaces)
-function buildPreciseQueriesForSegment(phrase){
+function buildPreciseQueriesForSegment(phrase) {
   const q = phrase.trim();
   const nq = norm(q);
 
-  const isCocina   = /\bcocina\b/.test(nq);
-  const isWCDeo    = (/(\bdesodorante|neutralizador|aromatizante|spray)\b/.test(nq) && /(\bwc|bañ|bano)\b/.test(nq)) || /\b(desodorante\s*wc|neutralizador\s*wc)\b/.test(nq);
+  const isCocina = /\bcocina\b/.test(nq);
+  const isWCDeo = (/(\bdesodorante|neutralizador|aromatizante|spray)\b/.test(nq) && /(\bwc|bañ|bano)\b/.test(nq)) || /\b(desodorante\s*wc|neutralizador\s*wc)\b/.test(nq);
   const isCookware = /\b(olla|ollas|cacerol|sarten|sart[eé]n|sartenes)\b/.test(nq);
 
   const queries = [];
-  if (q.length >= 6) queries.push(`"${q.slice(0,120)}"`); // frase exacta
+  if (q.length >= 6) queries.push(`"${q.slice(0, 120)}"`); // frase exacta
 
   // Syns si aparece literal
-  for (const key of Object.keys(SHOPPING_SYNONYMS)){
+  for (const key of Object.keys(SHOPPING_SYNONYMS)) {
     if (nq.includes(key)) for (const s of SHOPPING_SYNONYMS[key]) queries.push(s);
   }
   if (/\blimpiador( de)? cocina\b/.test(nq)) {
@@ -487,7 +492,7 @@ function buildPreciseQueriesForSegment(phrase){
 
   // Tokens útiles
   const tokens = tokenize(q).filter(t => !GENERIC_TOKENS.has(t));
-  if (tokens.length){
+  if (tokens.length) {
     queries.push(tokens.join(' '));
     for (const t of tokens) queries.push(t);
   }
@@ -495,41 +500,41 @@ function buildPreciseQueriesForSegment(phrase){
   // Cookware
   if (isCookware) {
     for (const s of SHOPPING_SYNONYMS['ollas']) queries.push(s);
-    queries.push('title:olla','title:sarten','title:cacerola','title:acero inoxidable');
+    queries.push('title:olla', 'title:sarten', 'title:cacerola', 'title:acero inoxidable');
   }
 
   // WC desodorante
   if (isWCDeo) {
     const wcSyns = SHOPPING_SYNONYMS['desodorante wc'];
     wcSyns.forEach(s => queries.push(s));
-    queries.push('title:wc title:neutralizador','title:wc title:desodorante');
+    queries.push('title:wc title:neutralizador', 'title:wc title:desodorante');
   }
 
   // Dedup + limit
-  const seen = new Set(); const out=[];
-  for (const x of queries){
+  const seen = new Set(); const out = [];
+  for (const x of queries) {
     const k = x.trim();
     if (!k || seen.has(k)) continue;
     seen.add(k); out.push(k);
-    if (out.length>=14) break;
+    if (out.length >= 14) break;
   }
   return { queries: out };
 }
 
 /* ----- Shopping list (varios ítems, mantiene orden) ----- */
-async function selectProductsByOrderedKeywords(message){
-  const parts = splitShopping(message||'');
+async function selectProductsByOrderedKeywords(message) {
+  const parts = splitShopping(message || '');
   if (parts.length < 2) return null;
-  const picks=[]; const used=new Set();
-  for (const seg of parts){
+  const picks = []; const used = new Set();
+  for (const seg of parts) {
     const m = await bestMatchForPhrase(seg);
-    if (m && !used.has(m.handle)){ picks.push(m); used.add(m.handle); }
+    if (m && !used.has(m.handle)) { picks.push(m); used.add(m.handle); }
   }
   return picks.length ? picks : null;
 }
 
 /* ===== Recomendación general: título > descripción + fallback body ===== */
-async function recommendByTitleFirst(userText, max=6){
+async function recommendByTitleFirst(userText, max = 6) {
   const queries = makeQueriesFromText(userText);
   const nq = norm(userText);
   const wantsCaps = /\b(pod|pods|capsula|capsulas|tab|tabs|pacs)\b/.test(nq);
@@ -539,21 +544,21 @@ async function recommendByTitleFirst(userText, max=6){
     // fallback: descripción (body)
     const bqs = bodyQueriesFromText(userText);
     const bodyPool = await buildPoolByQueries(bqs, 72);
-    const scoredB = bodyPool.map(p=>{
+    const scoredB = bodyPool.map(p => {
       const { th, dh, pen } = scoreProductAgainstTokens(p, userText);
       let bonus = -pen;
-      if (wantsCaps && /(pod|pods|capsula|capsulas|tab|tabs|pacs|3\s?en\s?1)/i.test(p.title||'')) bonus += 3;
-      if (wantsCaps && /\bliquido\b/i.test(p.title||'')) bonus -= 1;
+      if (wantsCaps && /(pod|pods|capsula|capsulas|tab|tabs|pacs|3\s?en\s?1)/i.test(p.title || '')) bonus += 3;
+      if (wantsCaps && /\bliquido\b/i.test(p.title || '')) bonus -= 1;
       return { ...p, _th: th, _dh: dh, _bn: bonus };
     }).sort(sortByTitleThenDesc);
     return scoredB.slice(0, max);
   }
 
-  const scored = pool.map(p=>{
+  const scored = pool.map(p => {
     const { th, dh, pen } = scoreProductAgainstTokens(p, userText);
     let bonus = -pen;
-    if (wantsCaps && /(pod|pods|capsula|capsulas|tab|tabs|pacs|3\s?en\s?1)/i.test(p.title||'')) bonus += 3;
-    if (wantsCaps && /\bliquido\b/i.test(p.title||'')) bonus -= 1;
+    if (wantsCaps && /(pod|pods|capsula|capsulas|tab|tabs|pacs|3\s?en\s?1)/i.test(p.title || '')) bonus += 3;
+    if (wantsCaps && /\bliquido\b/i.test(p.title || '')) bonus -= 1;
     return { ...p, _th: th, _dh: dh, _bn: bonus };
   });
 
@@ -592,61 +597,61 @@ Reglas:
 - Devuelve JSON válido. Nada fuera del JSON.
 `;
 
-async function aiProductQuery(userText){
-  try{
+async function aiProductQuery(userText) {
+  try {
     const ai = await openai.chat.completions.create({
       model: 'gpt-4o-mini',
       temperature: 0,
       messages: [
         { role: 'system', content: AI_PRODUCT_QUERY },
-        { role: 'user', content: String(userText||'').slice(0,500) }
+        { role: 'user', content: String(userText || '').slice(0, 500) }
       ]
     });
     const raw = (ai.choices?.[0]?.message?.content || '').trim();
     const m = raw.match(/\{[\s\S]*\}/);
     const parsed = JSON.parse(m ? m[0] : raw);
     const keywords = Array.isArray(parsed.keywords)
-      ? parsed.keywords.map(s=>singularize(norm(String(s).trim()))).filter(Boolean).filter(k=>!GENERIC_TOKENS.has(k)).slice(0,6)
+      ? parsed.keywords.map(s => singularize(norm(String(s).trim()))).filter(Boolean).filter(k => !GENERIC_TOKENS.has(k)).slice(0, 6)
       : [];
-    const brands   = Array.isArray(parsed.brands)   ? parsed.brands.map(s=>String(s).trim()).filter(Boolean).slice(0,3)   : [];
-    const max      = Math.max(3, Math.min(8, Number(parsed.max || 6) || 6));
+    const brands = Array.isArray(parsed.brands) ? parsed.brands.map(s => String(s).trim()).filter(Boolean).slice(0, 3) : [];
+    const max = Math.max(3, Math.min(8, Number(parsed.max || 6) || 6));
     return { keywords, brands, max };
-  }catch(e){
-    console.warn('[aiProductQuery] fallo o JSON inválido:', e?.message||e);
+  } catch (e) {
+    console.warn('[aiProductQuery] fallo o JSON inválido:', e?.message || e);
     return { keywords: [], brands: [], max: 6 };
   }
 }
 
 // Ejecuta varias consultas a Shopify combinando keywords y (si hay) marca
-async function searchByQueries(keywords=[], brands=[], max=6){
-  const pool=[]; const seen=new Set();
+async function searchByQueries(keywords = [], brands = [], max = 6) {
+  const pool = []; const seen = new Set();
 
   const queries = [];
-  for (const k of keywords){
+  for (const k of keywords) {
     if (!k || GENERIC_TOKENS.has(norm(k))) continue;
     queries.push(k);
-    for (const b of brands){
+    for (const b of brands) {
       queries.push(`${k} ${b}`);
       queries.push(`${b} ${k}`);
     }
   }
-  if (!queries.length && brands.length){
+  if (!queries.length && brands.length) {
     for (const b of brands) queries.push(b);
   }
   if (!queries.length) return [];
 
-  for (const q of queries.slice(0, 12)){
-    const found = await searchProductsPlain(q, 12).catch(()=>[]);
-    for (const it of found){
-      if (!seen.has(it.handle)){
+  for (const q of queries.slice(0, 12)) {
+    const found = await searchProductsPlain(q, 12).catch(() => []);
+    for (const it of found) {
+      if (!seen.has(it.handle)) {
         seen.add(it.handle);
         pool.push(it);
-        if (pool.length >= max*3) break;
+        if (pool.length >= max * 3) break;
       }
     }
-    if (pool.length >= max*3) break;
+    if (pool.length >= max * 3) break;
   }
-  return pool.sort((a,b)=>{
+  return pool.sort((a, b) => {
     if (a.availableForSale !== b.availableForSale) return a.availableForSale ? -1 : 1;
     return 0;
   }).slice(0, max);
@@ -655,56 +660,56 @@ async function searchByQueries(keywords=[], brands=[], max=6){
 /* ---------- STOCK helpers/intents ---------- */
 const STOCK_REGEX = /\b(stock|en\s+stock|stok|disponible|disponibilidad|quedan?|inventario)\b/i;
 
-function extractHandleFromText(s=''){
-  const m = String(s||'').match(/\/products\/([a-z0-9\-_%\.]+)/i);
+function extractHandleFromText(s = '') {
+  const m = String(s || '').match(/\/products\/([a-z0-9\-_%\.]+)/i);
   return m ? m[1] : null;
 }
 
-function tokenizeStrict(s=''){
+function tokenizeStrict(s = '') {
   return String(s)
-    .normalize('NFD').replace(/[\u0300-\u036f]/g,'')
+    .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
     .toLowerCase()
-    .replace(/[^a-z0-9\s]/g,' ')
+    .replace(/[^a-z0-9\s]/g, ' ')
     .split(/\s+/).filter(Boolean);
 }
 
-function extractBrandTokens(text=''){
+function extractBrandTokens(text = '') {
   const q = tokenizeStrict(text).join(' ');
   const hits = [];
-  for (const b of KNOWN_BRANDS){
+  for (const b of KNOWN_BRANDS) {
     const needle = b.toLowerCase();
     if (q.includes(needle)) hits.push(needle);
   }
   return Array.from(new Set(hits));
 }
 
-function scoreTitleForStock(title='', tokens=[], brandTokens=[]){
+function scoreTitleForStock(title = '', tokens = [], brandTokens = []) {
   const t = tokenizeStrict(title);
   const set = new Set(t);
   let score = 0;
-  for (const tok of tokens){
+  for (const tok of tokens) {
     if (set.has(tok)) score += 1;
   }
-  for (const b of brandTokens){
+  for (const b of brandTokens) {
     const parts = b.split(' ');
     if (parts.every(p => set.has(p))) score += 2;
   }
   if (tokens.includes('pasta') && set.has('pasta')) score += 1;
-  if (tokens.includes('multiuso') || tokens.includes('multiusos')){
+  if (tokens.includes('multiuso') || tokens.includes('multiusos')) {
     if (set.has('multiuso') || set.has('multiusos')) score += 1;
   }
   return score;
 }
 
-async function findHandleForStock(message='', meta={}){
+async function findHandleForStock(message = '', meta = {}) {
   const brandTokens = extractBrandTokens(message);
   const rawTokens = tokenizeStrict(message).filter(w => w.length >= 3);
 
-  const stop = new Set(['la','el','de','del','para','con','una','un','los','las','tienen','tiene','hay','queda','quedan','stock','en','cuanto','cuánta','cuanta','original','producto']);
+  const stop = new Set(['la', 'el', 'de', 'del', 'para', 'con', 'una', 'un', 'los', 'las', 'tienen', 'tiene', 'hay', 'queda', 'quedan', 'stock', 'en', 'cuanto', 'cuánta', 'cuanta', 'original', 'producto']);
   const tokens = rawTokens.filter(t => !stop.has(t));
 
   const queries = [];
-  if (brandTokens.length){
+  if (brandTokens.length) {
     const brand = brandTokens[0];
     if (tokens.length) {
       queries.push(tokens.join(' ') + ' ' + brand);
@@ -722,11 +727,11 @@ async function findHandleForStock(message='', meta={}){
 
   const seen = new Set();
   const pool = [];
-  for (const q of queries.slice(0, 4)){
+  for (const q of queries.slice(0, 4)) {
     if (!q) continue;
-    const found = await searchProductsPlain(q, 15).catch(()=>[]);
-    for (const it of found){
-      if (!seen.has(it.handle)){
+    const found = await searchProductsPlain(q, 15).catch(() => []);
+    for (const it of found) {
+      if (!seen.has(it.handle)) {
         seen.add(it.handle);
         pool.push(it);
       }
@@ -744,8 +749,8 @@ async function findHandleForStock(message='', meta={}){
   const candidateList = (requirePasta ? good.filter(x => /pasta/i.test(x.title)) : good);
 
   const list = (candidateList.length ? candidateList : scored)
-    .sort((a,b)=>{
-      if (a.availableForSale !== b.availableForSale){
+    .sort((a, b) => {
+      if (a.availableForSale !== b.availableForSale) {
         return a.availableForSale ? -1 : 1;
       }
       return b._score - a._score;
@@ -755,18 +760,18 @@ async function findHandleForStock(message='', meta={}){
 }
 
 // Formatos
-function pluralUnidad(n){ return (Number(n) === 1) ? 'unidad' : 'unidades'; }
-function pluralDisponible(n){ return (Number(n) === 1) ? 'disponible' : 'disponibles'; }
-function isDefaultVariantTitle(t=''){ return /default\s*title/i.test(String(t)); }
+function pluralUnidad(n) { return (Number(n) === 1) ? 'unidad' : 'unidades'; }
+function pluralDisponible(n) { return (Number(n) === 1) ? 'disponible' : 'disponibles'; }
+function isDefaultVariantTitle(t = '') { return /default\s*title/i.test(String(t)); }
 
 /* ----- Intents ----- */
 const PURPOSE_REGEX = /\b(para que sirve|para qué sirve|que es|qué es|como usar|cómo usar|modo de uso|instrucciones|paso a paso|como limpiar|cómo limpiar|consejos|tips|guia|guía|pasos)\b/i;
 
-function detectIntent(text=''){
+function detectIntent(text = '') {
   const q = norm(text);
 
   // Si viene "envío <lugar>", rutear a shipping_region
-  const m = String(text||'').match(/^env[ií]o\s+(.+)$/i);
+  const m = String(text || '').match(/^env[ií]o\s+(.+)$/i);
   if (m) {
     const loc = fold(m[1]);
     if (REGIONES_F.has(loc) || COMUNAS_F.has(loc)) return 'shipping_region';
@@ -789,10 +794,10 @@ function detectIntent(text=''){
   return 'browse';
 }
 
-function parseBrandCarouselConfig(){ try { return JSON.parse(BRAND_CAROUSEL_JSON||''); } catch { return []; } }
+function parseBrandCarouselConfig() { try { return JSON.parse(BRAND_CAROUSEL_JSON || ''); } catch { return []; } }
 
 /* ====== Storefront stock (sin Admin) ====== */
-async function fetchStorefrontStockByHandle(handle){
+async function fetchStorefrontStockByHandle(handle) {
   const d = await gql(`
     query($h:String!){
       productByHandle(handle:$h){
@@ -821,7 +826,7 @@ async function fetchStorefrontStockByHandle(handle){
 
   const totals = variants
     .map(v => (typeof v.quantityAvailable === 'number' ? v.quantityAvailable : 0))
-    .reduce((a,b)=>a+b,0);
+    .reduce((a, b) => a + b, 0);
 
   const hasAnyNumber = variants.some(v => typeof v.quantityAvailable === 'number');
   return {
@@ -832,18 +837,38 @@ async function fetchStorefrontStockByHandle(handle){
 }
 
 /* =============== Endpoint =============== */
-app.post('/chat', async (req,res)=>{
-  try{
-    const { message, toolResult, meta={} } = req.body;
+app.post('/chat', async (req, res) => {
+  try {
+    const { message, toolResult, meta = {} } = req.body;
     const FREE_TH = Number(FREE_SHIPPING_THRESHOLD_CLP ?? FREE_TH_DEFAULT);
 
     /* ----------- POST-TOOL HANDLER ----------- */
+    // Opción B: aceptamos tanto variantId como productHandle, pero el "tool"
+    // se ejecuta en el front. Aquí solo devolvemos un mensaje amable.
     if (toolResult?.id) {
+      try {
+        const result = toolResult.result || {};
+        const { variantId, productHandle, quantity } = result;
+        console.log('[ML Chat toolResult]', {
+          id: toolResult.id,
+          variantId: variantId || null,
+          productHandle: productHandle || null,
+          quantity: quantity || null
+        });
+      } catch (e) {
+        console.warn('[ML Chat toolResult] no se pudo loguear:', e?.message || e);
+      }
+
       return res.json({ text: "¡Listo! Producto agregado 👍" });
     }
 
+    // Si por algún motivo no llega message ni toolResult, responder algo neutro
+    if (!message) {
+      return res.json({ text: "¿En qué te ayudo? Puedo sugerirte productos, formas de uso o calcular envío por región." });
+    }
+
     /* ----------- INTENTS ----------- */
-    const intent = detectIntent(message||'');
+    const intent = detectIntent(message || '');
 
     /* ---- STOCK (Storefront) ---- */
     if (intent === 'stock') {
@@ -856,14 +881,14 @@ app.post('/chat', async (req,res)=>{
       if (!handle) {
         try {
           handle = await findHandleForStock(message || '', meta);
-        } catch {}
+        } catch { }
       }
 
       if (!handle) {
         try {
           const found = await recommendByTitleFirst(message || '', 1);
           if (found && found[0]) handle = found[0].handle;
-        } catch {}
+        } catch { }
       }
 
       if (!handle) {
@@ -918,130 +943,130 @@ app.post('/chat', async (req,res)=>{
     }
 
     /* ---- Más vendidos ---- */
-    if (intent === 'tops'){
-      const items = await listTopSellers(10).then(xs=>preferInStock(xs,8));
+    if (intent === 'tops') {
+      const items = await listTopSellers(10).then(xs => preferInStock(xs, 8));
       if (!items.length) return res.json({ text: "Por ahora no tengo un ranking de más vendidos." });
       return res.json({ text: buildProductsMarkdown(items) });
     }
 
     /* ---- Marcas (BRANDS chips) ---- */
-    if (intent === 'brands'){
+    if (intent === 'brands') {
       const custom = parseBrandCarouselConfig();
-      if (custom.length){
-        const lines = custom.map(b=>[b.title,b.url,b.image||''].join('|')).join('\n');
+      if (custom.length) {
+        const lines = custom.map(b => [b.title, b.url, b.image || ''].join('|')).join('\n');
         return res.json({ text: `BRANDS:\n${lines}` });
       }
       const d = await gql(`query{ products(first:120){ edges{ node{ vendor } } } }`);
-      const vendors = (d.products?.edges||[]).map(e=>String(e.node.vendor||'').trim()).filter(Boolean);
-      const top = Array.from(new Set(vendors)).slice(0,48);
-      if (top.length){
-        const payload = top.map(v=>`${v}|${BASE}/collections/vendors?q=${encodeURIComponent(v)}|`).join('\n');
+      const vendors = (d.products?.edges || []).map(e => String(e.node.vendor || '').trim()).filter(Boolean);
+      const top = Array.from(new Set(vendors)).slice(0, 48);
+      if (top.length) {
+        const payload = top.map(v => `${v}|${BASE}/collections/vendors?q=${encodeURIComponent(v)}|`).join('\n');
         return res.json({ text: `BRANDS:\n${payload}` });
       }
       return res.json({ text: 'Trabajamos varias marcas internacionales y locales. ¿Cuál te interesa?' });
     }
 
     /* ---- Categorías (CATS chips) ---- */
-    if (intent === 'categories'){
+    if (intent === 'categories') {
       const cols = await listCollections(12);
-      if (cols.length){
-        const payload = cols.map(c=>`${c.title}|${BASE}/collections/${c.handle}`).join('\n');
+      if (cols.length) {
+        const payload = cols.map(c => `${c.title}|${BASE}/collections/${c.handle}`).join('\n');
         return res.json({ text: `CATS:\n${payload}` });
       }
       const fallback = [
         ['LIMPIEZA Y ASEO', `${BASE}/search?q=limpieza`],
-        ['LAVADO DE ROPA',  `${BASE}/search?q=ropa`],
-        ['CUIDADO PERSONAL',`${BASE}/search?q=personal`],
-        ['COCINA',          `${BASE}/search?q=cocina`],
-        ['BAÑO',            `${BASE}/search?q=ba%C3%B1o`],
-        ['PISOS',           `${BASE}/search?q=pisos`],
+        ['LAVADO DE ROPA', `${BASE}/search?q=ropa`],
+        ['CUIDADO PERSONAL', `${BASE}/search?q=personal`],
+        ['COCINA', `${BASE}/search?q=cocina`],
+        ['BAÑO', `${BASE}/search?q=ba%C3%B1o`],
+        ['PISOS', `${BASE}/search?q=pisos`],
       ];
-      const payload = fallback.map(([t,u])=>`${t}|${u}`).join('\n');
+      const payload = fallback.map(([t, u]) => `${t}|${u}`).join('\n');
       return res.json({ text: `CATS:\n${payload}` });
     }
 
     /* ---- Envíos (general con carrusel REGIONS) ---- */
-    if (intent === 'shipping'){
-      const header = FREE_TH>0 ? `En **RM** hay **envío gratis** sobre **${fmtCLP(FREE_TH)}**.` : `Hacemos despacho a **todo Chile**.`;
+    if (intent === 'shipping') {
+      const header = FREE_TH > 0 ? `En **RM** hay **envío gratis** sobre **${fmtCLP(FREE_TH)}**.` : `Hacemos despacho a **todo Chile**.`;
       const general = `El costo se calcula en el **checkout** según **región y comuna**. Elige tu región para ver el costo referencial:`;
       const tarifas =
-        `Tarifas por zona:\n`+
-        `- **REGIÓN METROPOLITANA**: ${fmtCLP(3990)}\n`+
-        `- **ZONA CENTRAL**: ${fmtCLP(6990)} (Coquimbo, Valparaíso, O’Higgins, Maule, Ñuble, Biobío, Araucanía, Los Ríos, Los Lagos)\n`+
-        `- **ZONA NORTE**: ${fmtCLP(10990)} (Arica y Parinacota, Tarapacá, Antofagasta, Atacama)\n`+
+        `Tarifas por zona:\n` +
+        `- **REGIÓN METROPOLITANA**: ${fmtCLP(3990)}\n` +
+        `- **ZONA CENTRAL**: ${fmtCLP(6990)} (Coquimbo, Valparaíso, O’Higgins, Maule, Ñuble, Biobío, Araucanía, Los Ríos, Los Lagos)\n` +
+        `- **ZONA NORTE**: ${fmtCLP(10990)} (Arica y Parinacota, Tarapacá, Antofagasta, Atacama)\n` +
         `- **ZONA AUSTRAL**: ${fmtCLP(14990)} (Aysén, Magallanes)`;
       const regions = regionsPayloadLines();
       return res.json({ text: `${header}\n${general}\n\nREGIONS:\n${regions}\n\n${tarifas}` });
     }
 
     /* ---- Envíos (cuando escribe la región/comuna) ---- */
-    if (intent === 'shipping_region'){
-      const q = String(message||'').trim();
+    if (intent === 'shipping_region') {
+      const q = String(message || '').trim();
       if (REGIONES_F.has(fold(q)) || /^env[ií]o\s+/i.test(q)) {
-        const reg = q.replace(/^env[ií]o\s+/i,'').trim();
+        const reg = q.replace(/^env[ií]o\s+/i, '').trim();
         const ship = shippingByRegionName(reg);
         const isRM = /metropolitana|santiago/.test(fold(reg));
         const pieces = [];
         if (ship) pieces.push(`Para **${reg}** (${ship.zone}) el costo referencial es **${fmtCLP(ship.cost)}**.`);
         else pieces.push(`Para **${reg}** el costo se calcula en el checkout por región/comuna.`);
-        if (isRM && FREE_TH>0) pieces.push(`En **RM** hay **envío gratis** sobre **${fmtCLP(FREE_TH)}**.`);
+        if (isRM && FREE_TH > 0) pieces.push(`En **RM** hay **envío gratis** sobre **${fmtCLP(FREE_TH)}**.`);
         return res.json({ text: pieces.join(' ') });
       }
-      if (COMUNAS_F.has(fold(q))){
+      if (COMUNAS_F.has(fold(q))) {
         return res.json({ text: `Despachamos a **todo Chile**. Para **${q}**, ingresa tu **región/comuna** en el checkout y verás el costo exacto. Si me dices tu **región**, te doy el costo referencial.` });
       }
     }
 
     /* ---- Mundopuntos ---- */
-    if (intent === 'points'){
+    if (intent === 'points') {
       const earn = Number(MUNDOPUNTOS_EARN_PER_CLP || 1);
       const redeem100 = Number(MUNDOPUNTOS_REDEEM_PER_100 || 3);
       const url = (MUNDOPUNTOS_PAGE_URL || '').trim();
-      return res.json({ text: `**Mundopuntos**: ganas **${earn} punto(s) por $1**. Canje: **100 puntos = ${fmtCLP(redeem100)}**. ${url?`Más info: ${url}`:'Adminístralo en el widget de recompensas.'}` });
+      return res.json({ text: `**Mundopuntos**: ganas **${earn} punto(s) por $1**. Canje: **100 puntos = ${fmtCLP(redeem100)}**. ${url ? `Más info: ${url}` : 'Adminístralo en el widget de recompensas.'}` });
     }
 
     /* ---- Shopping list (varios ítems) ---- */
-    if (intent === 'shopping'){
-      const picks = await selectProductsByOrderedKeywords(message||'');
-      if (picks && picks.length){
+    if (intent === 'shopping') {
+      const picks = await selectProductsByOrderedKeywords(message || '');
+      if (picks && picks.length) {
         return res.json({ text: `Te dejo una opción por ítem:\n\n${buildProductsMarkdown(picks)}` });
       }
       // si no hubo match, cae a recomendación normal
     }
 
     /* ---- IA para info (paso a paso) + recomendaciones — PRIORIDAD TÍTULO ---- */
-    if (intent === 'info' || intent === 'browse'){
+    if (intent === 'info' || intent === 'browse') {
       let items = [];
       try {
-        items = await recommendByTitleFirst(message||'', 6);
+        items = await recommendByTitleFirst(message || '', 6);
       } catch (err) {
-        console.warn('[recommendByTitleFirst] error', err?.message||err);
+        console.warn('[recommendByTitleFirst] error', err?.message || err);
       }
 
-      if (!items.length){
-        try{
-          const { keywords, brands, max } = await aiProductQuery(message||'');
-          if (keywords.length || brands.length){
+      if (!items.length) {
+        try {
+          const { keywords, brands, max } = await aiProductQuery(message || '');
+          if (keywords.length || brands.length) {
             items = await searchByQueries(keywords, brands, Math.min(6, max));
           }
-        }catch(err){
-          console.warn('[searchByQueries] error', err?.message||err);
+        } catch (err) {
+          console.warn('[searchByQueries] error', err?.message || err);
         }
       }
 
-      if (!items.length){
+      if (!items.length) {
         // Fallback: descripción (body)
-        const bqs = bodyQueriesFromText(message||'');
+        const bqs = bodyQueriesFromText(message || '');
         const bodyPool = await buildPoolByQueries(bqs, 72);
-        const scored = bodyPool.map(p=>{
-          const { th, dh, pen } = scoreProductAgainstTokens(p, message||'');
+        const scored = bodyPool.map(p => {
+          const { th, dh, pen } = scoreProductAgainstTokens(p, message || '');
           return { ...p, _th: th, _dh: dh, _bn: -pen };
         }).sort(sortByTitleThenDesc);
-        items = scored.slice(0,6);
+        items = scored.slice(0, 6);
       }
 
       let tipText = '';
-      try{
+      try {
         const ai = await openai.chat.completions.create({
           model: 'gpt-4o-mini',
           messages: [
@@ -1051,16 +1076,16 @@ app.post('/chat', async (req,res)=>{
         });
         const out = (ai.choices?.[0]?.message?.content || '').trim();
         if (out) tipText = `TIP: ${out}`;
-      }catch(err){
-        console.warn('[ai] fallo mini plan', err?.message||err);
+      } catch (err) {
+        console.warn('[ai] fallo mini plan', err?.message || err);
       }
 
       const list = (items && items.length)
         ? `\n\n${buildProductsMarkdown(items)}`
         : '';
 
-      const greet = (meta?.userFirstName && meta?.tipAlreadyShown!==true && Number(meta?.cartSubtotalCLP||0) < Number(FREE_TH||FREE_TH_DEFAULT))
-        ? `TIP: Hola, ${meta.userFirstName} 👋 | Te faltan ${fmtCLP(Number(FREE_TH||FREE_TH_DEFAULT) - Number(meta?.cartSubtotalCLP||0))} para envío gratis en RM\n\n`
+      const greet = (meta?.userFirstName && meta?.tipAlreadyShown !== true && Number(meta?.cartSubtotalCLP || 0) < Number(FREE_TH || FREE_TH_DEFAULT))
+        ? `TIP: Hola, ${meta.userFirstName} 👋 | Te faltan ${fmtCLP(Number(FREE_TH || FREE_TH_DEFAULT) - Number(meta?.cartSubtotalCLP || 0))} para envío gratis en RM\n\n`
         : '';
 
       const finalText = (tipText ? `${greet}${tipText}${list}` : (list || 'No encontré coincidencias exactas. ¿Me das una pista más (marca, superficie, aroma)?'));
@@ -1069,13 +1094,14 @@ app.post('/chat', async (req,res)=>{
 
     return res.json({ text: "¿Me cuentas un poco más? Puedo sugerirte productos o calcular envío por región." });
 
-  }catch(e){
+  } catch (e) {
     console.error(e);
     return res.status(500).json({ error: String(e) });
   }
 });
 
 /* ---- Health ---- */
-app.get('/health', (_,res)=>res.json({ ok:true }));
+app.get('/health', (_, res) => res.json({ ok: true }));
 const port = PORT || process.env.PORT || 3000;
-app.listen(port, ()=>console.log('ML Chat server on :'+port));
+app.listen(port, () => console.log('ML Chat server on :' + port));
+
