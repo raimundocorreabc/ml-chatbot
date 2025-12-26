@@ -1122,8 +1122,8 @@ app.post('/chat', async (req, res) => {
         )}`;
 
         const finalText = expl
-          ? `${greet}${expl}${list}`
-          : `${greet}${fallbackText}${list}`;
+           ? `${greet}${expl}\n\nPRODUCTS:\n${items.map(p => p.handle).join('\n')}`
+           : `${greet}${fallbackText}\n\nPRODUCTS:\n${items.map(p => p.handle).join('\n')}`;
 
         return res.json({ text: finalText });
       }
