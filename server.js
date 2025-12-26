@@ -1,7 +1,6 @@
 // server.js — IA-first + catálogo/brands/envíos/regiones/shopping-list + IA→keywords→Shopify + STOCK
 // Lógica de ranking: TÍTULO > DESCRIPCIÓN (empate) > DESCRIPCIÓN (si no hay hits en título)
 // Mejora: stemming simétrico, sinónimos pods/cápsulas, bonus para pods, sin penalizar packs.
-// ✅ NUEVO: para intent "info/browse" ahora recomienda productos + explica beneficios + precio real (Storefront).
 
 import 'dotenv/config';
 import express from 'express';
@@ -64,12 +63,6 @@ async function gql(query, variables = {}) {
   return data.data;
 }
 
-/* =============== Money helpers =============== */
-function parseAmountToNumber(amount) {
-  const n = Number(amount);
-  return Number.isFinite(n) ? n : 0;
-}
-
 /* ----- Catálogo helpers ----- */
 async function listCollections(limit = 10) {
   const d = await gql(`
@@ -79,29 +72,18 @@ async function listCollections(limit = 10) {
 }
 
 async function searchProductsPlain(query, first = 5) {
-  // ✅ NUEVO: traemos precio real (minVariantPrice) y un "preview" de variant para más compatibilidad.
+  // Pedimos vendor, productType, tags y description para poder puntuar por "descripción"
   const d = await gql(`
     query($q:String!,$n:Int!){
       search(query:$q, types: PRODUCT, first:$n){
         edges{ node{
           ... on Product {
-            title
-            handle
-            availableForSale
-            vendor
-            productType
-            tags
-            description
-
-            priceRange {
-              minVariantPrice { amount currencyCode }
-            }
+            title handle availableForSale vendor productType tags description
           }
         } }
       }
     }
   `, { q: query, n: first });
-
   return (d.search?.edges || []).map(e => ({
     title: e.node.title,
     handle: e.node.handle,
@@ -109,9 +91,7 @@ async function searchProductsPlain(query, first = 5) {
     vendor: e.node.vendor || '',
     productType: e.node.productType || '',
     tags: Array.isArray(e.node.tags) ? e.node.tags : [],
-    description: e.node.description || '',
-    priceCLP: parseAmountToNumber(e.node.priceRange?.minVariantPrice?.amount || 0),
-    currencyCode: e.node.priceRange?.minVariantPrice?.currencyCode || 'CLP'
+    description: e.node.description || ''
   }));
 }
 
@@ -128,11 +108,7 @@ async function listTopSellers(first = 8) {
           }
         }
       `, { h: handle, n: first });
-      const items = (d.collectionByHandle?.products?.edges || []).map(e => ({
-        title: e.node.title,
-        handle: e.node.handle,
-        availableForSale: !!e.node.availableForSale
-      }));
+      const items = (d.collectionByHandle?.products?.edges || []).map(e => ({ title: e.node.title, handle: e.node.handle, availableForSale: !!e.node.availableForSale }));
       if (items.length) return items;
       console.warn('[tops] Colección vacía o inválida:', handle);
     } catch (err) { console.warn('[tops] error colección', err?.message || err); }
@@ -141,11 +117,7 @@ async function listTopSellers(first = 8) {
     const d = await gql(`
       query($n:Int!){ products(first:$n, sortKey: BEST_SELLING){ edges{ node{ title handle availableForSale } } } }
     `, { n: first });
-    const items = (d.products?.edges || []).map(e => ({
-      title: e.node.title,
-      handle: e.node.handle,
-      availableForSale: !!e.node.availableForSale
-    }));
+    const items = (d.products?.edges || []).map(e => ({ title: e.node.title, handle: e.node.handle, availableForSale: !!e.node.availableForSale }));
     if (items.length) return items;
   } catch (err) { console.warn('[tops] error global', err?.message || err); }
   const any = await gql(`query($n:Int!){ products(first:$n){ edges{ node{ title handle availableForSale } } } }`, { n: first });
@@ -154,14 +126,7 @@ async function listTopSellers(first = 8) {
 
 function buildProductsMarkdown(items = []) {
   if (!items.length) return null;
-
-  // ✅ NUEVO: si viene precio, lo mostramos.
-  const lines = items.map((p, i) => {
-    const safeTitle = (p.title || 'Ver producto').replace(/\*/g, '');
-    const price = (p.priceCLP && p.priceCLP > 0) ? ` — **${fmtCLP(p.priceCLP)}**` : '';
-    return `${i + 1}. **[${safeTitle}](${BASE}/products/${p.handle})**${price}`;
-  });
-
+  const lines = items.map((p, i) => `${i + 1}. **[${(p.title || 'Ver producto').replace(/\*/g, '')}](${BASE}/products/${p.handle})**`);
   return `Aquí tienes opciones:\n\n${lines.join('\n')}`;
 }
 
@@ -244,17 +209,11 @@ const KNOWN_BRANDS = [
 ];
 
 const GENERIC_TOKENS = new Set(['limpiar', 'limpieza', 'especialista', 'spray', 'gatillo', 'hogar', 'casa'].map(norm));
+
 const SHORT_TOKENS_WHITELIST = new Set(['wc', 'ph', 'kh7', '3en1', '3 en 1', 'pc', 'tv'].map(norm));
 
 /* ---------- Token helpers (stemming simétrico) ---------- */
 function singularize(w) { return w.replace(/(?:es|s)$/, ''); }
-
-const STOPWORDS = new Set([
-  'la', 'el', 'los', 'las', 'de', 'del', 'para', 'por', 'con', 'y', 'o', 'u', 'un', 'una', 'unos', 'unas',
-  'al', 'en', 'mi', 'tu', 'su', 'sus', 'que', 'qué', 'como', 'cómo', 'quiero', 'necesito',
-  'recomiendas', 'recomendar', 'limpieza', 'limpiar', 'mucho', 'poco', 'tengo', 'hay',
-  'me', 'mi', 'algo', 'hogar', 'casa', 'producto', 'productos'
-].map(norm));
 
 function tokenClean(s = '') {
   return norm(s)
@@ -264,8 +223,6 @@ function tokenClean(s = '') {
     .map(singularize)
     .filter(t => (t.length >= 3 || SHORT_TOKENS_WHITELIST.has(t)) && !STOPWORDS.has(t));
 }
-
-function tokenize(s) { return tokenClean(s); }
 
 function wordSet(s) {
   return new Set(
@@ -283,6 +240,15 @@ function countHitsIn(text, tokens) {
   for (const t of tokens) if (set.has(t)) n++;
   return n;
 }
+
+const STOPWORDS = new Set([
+  'la', 'el', 'los', 'las', 'de', 'del', 'para', 'por', 'con', 'y', 'o', 'u', 'un', 'una', 'unos', 'unas',
+  'al', 'en', 'mi', 'tu', 'su', 'sus', 'que', 'qué', 'como', 'cómo', 'quiero', 'necesito',
+  'recomiendas', 'recomendar', 'limpieza', 'limpiar', 'mucho', 'poco', 'tengo', 'hay',
+  'me', 'mi', 'algo', 'hogar', 'casa', 'producto', 'productos'
+].map(norm));
+
+function tokenize(s) { return tokenClean(s); }
 
 // Expansión de sinónimos básicos (incluye pods/cápsulas, stickers/calcomanías, sarro/cal, moho/mildew, etc.)
 const BASIC_SYNONYMS = {
@@ -358,7 +324,6 @@ const SURFACE_CLASH = {
   acero: ['madera', 'alfombra'],
   ropa: ['madera', 'parrilla', 'pisos']
 };
-
 function clashPenalty(userSurface, title = '') {
   if (!userSurface) return 0;
   const t = norm(title);
@@ -404,18 +369,23 @@ function scoreProductAgainstTokens(p, userText) {
   const title = p.title || '';
   const desc = compositeDescription(p);
 
-  const th = countHitsIn(title, tokens); // Title hits
-  const dh = countHitsIn(desc, tokens);  // Description hits
+  const th = countHitsIn(title, tokens);                // Title hits
+  const dh = countHitsIn(desc, tokens);                 // Description hits (desc+vendor+tags+ptype)
   const pen = clashPenalty(surf, title);
 
   return { th, dh, pen };
 }
 
 function sortByTitleThenDesc(a, b) {
+  // disponibilidad primero
   if (a.availableForSale !== b.availableForSale) return a.availableForSale ? -1 : 1;
+  // mayor coincidencia en TÍTULO
   if (a._th !== b._th) return b._th - a._th;
+  // empate: mayor coincidencia en DESCRIPCIÓN
   if (a._dh !== b._dh) return b._dh - a._dh;
+  // bonus (si existe)
   if ((a._bn || 0) !== (b._bn || 0)) return (b._bn || 0) - (a._bn || 0);
+  // desempate final: título más corto
   return (a.title || '').length - (b.title || '').length;
 }
 
@@ -431,9 +401,10 @@ function makeQueriesFromText(text = '') {
   if (toks.length) {
     const joined = toks.filter(t => !GENERIC_TOKENS.has(t)).join(' ').trim();
     if (joined) queries.push(joined);
-    for (const t of toks) if (!GENERIC_TOKENS.has(t)) queries.push(t);
+    for (const t of toks) {
+      if (!GENERIC_TOKENS.has(t)) queries.push(t);
+    }
   }
-
   for (const key of Object.keys(SHOPPING_SYNONYMS)) {
     if (norm(text).includes(norm(key))) queries.push(key);
   }
@@ -486,6 +457,7 @@ async function bestMatchForPhrase(phrase) {
   }
   if (!pool.length) return null;
 
+  // Scoring: título > descripción (y bonus por cápsulas si aplica)
   const scored = pool.map(p => {
     const { th, dh, pen } = scoreProductAgainstTokens(p, phrase);
     let bonus = -pen;
@@ -498,16 +470,19 @@ async function bestMatchForPhrase(phrase) {
   return scored[0] || null;
 }
 
+// Construcción de queries “de precisión” por segmento (usa syns y surfaces)
 function buildPreciseQueriesForSegment(phrase) {
   const q = phrase.trim();
   const nq = norm(q);
 
+  const isCocina = /\bcocina\b/.test(nq);
   const isWCDeo = (/(\bdesodorante|neutralizador|aromatizante|spray)\b/.test(nq) && /(\bwc|bañ|bano)\b/.test(nq)) || /\b(desodorante\s*wc|neutralizador\s*wc)\b/.test(nq);
   const isCookware = /\b(olla|ollas|cacerol|sarten|sart[eé]n|sartenes)\b/.test(nq);
 
   const queries = [];
-  if (q.length >= 6) queries.push(`"${q.slice(0, 120)}"`);
+  if (q.length >= 6) queries.push(`"${q.slice(0, 120)}"`); // frase exacta
 
+  // Syns si aparece literal
   for (const key of Object.keys(SHOPPING_SYNONYMS)) {
     if (nq.includes(key)) for (const s of SHOPPING_SYNONYMS[key]) queries.push(s);
   }
@@ -515,23 +490,27 @@ function buildPreciseQueriesForSegment(phrase) {
     for (const s of SHOPPING_SYNONYMS['cocina']) queries.push(s);
   }
 
+  // Tokens útiles
   const tokens = tokenize(q).filter(t => !GENERIC_TOKENS.has(t));
   if (tokens.length) {
     queries.push(tokens.join(' '));
     for (const t of tokens) queries.push(t);
   }
 
+  // Cookware
   if (isCookware) {
     for (const s of SHOPPING_SYNONYMS['ollas']) queries.push(s);
     queries.push('title:olla', 'title:sarten', 'title:cacerola', 'title:acero inoxidable');
   }
 
+  // WC desodorante
   if (isWCDeo) {
     const wcSyns = SHOPPING_SYNONYMS['desodorante wc'];
     wcSyns.forEach(s => queries.push(s));
     queries.push('title:wc title:neutralizador', 'title:wc title:desodorante');
   }
 
+  // Dedup + limit
   const seen = new Set(); const out = [];
   for (const x of queries) {
     const k = x.trim();
@@ -542,6 +521,7 @@ function buildPreciseQueriesForSegment(phrase) {
   return { queries: out };
 }
 
+/* ----- Shopping list (varios ítems, mantiene orden) ----- */
 async function selectProductsByOrderedKeywords(message) {
   const parts = splitShopping(message || '');
   if (parts.length < 2) return null;
@@ -561,6 +541,7 @@ async function recommendByTitleFirst(userText, max = 6) {
 
   const pool = await buildPoolByQueries(queries, 72);
   if (!pool.length) {
+    // fallback: descripción (body)
     const bqs = bodyQueriesFromText(userText);
     const bodyPool = await buildPoolByQueries(bqs, 72);
     const scoredB = bodyPool.map(p => {
@@ -581,6 +562,7 @@ async function recommendByTitleFirst(userText, max = 6) {
     return { ...p, _th: th, _dh: dh, _bn: bonus };
   });
 
+  // 1) Si hay _th>0, ordenamos por título y descripción; si no, intentamos _dh>0
   const anyTitleHit = scored.some(x => x._th > 0);
   let candidates = scored;
   if (anyTitleHit) {
@@ -600,20 +582,6 @@ Eres el asistente de MundoLimpio.cl (Chile), experto en limpieza.
 Responde primero con 3–5 bullets (pasos claros y seguros).
 NO incluyas CTAs como "¿Te sugiero...?" ni enlaces, marcas o /products/ dentro del TIP.
 Tono cercano y breve. No inventes stock, marcas ni precios.
-`;
-
-/* ✅ NUEVO: IA para explicar productos reales + beneficios + precio */
-const AI_PRODUCT_EXPLAINER = `
-Eres el asistente experto de MundoLimpio.cl (Chile).
-Te entregarán un listado de productos reales de la tienda (con precio).
-Tu tarea: responder a la pregunta del usuario recomendando 1–2 productos del listado.
-Incluye:
-- Por qué sirve para el caso del usuario
-- Beneficios/características (sin inventar)
-- Cómo usarlo (pasos breves y seguros)
-- Precio real (tal cual viene en el listado)
-No inventes productos, precios, stock ni certificaciones.
-Tono cercano, claro y vendedor premium (sin exagerar).
 `;
 
 /* ----- IA → intención de productos (keywords/marcas) ----- */
@@ -654,6 +622,7 @@ async function aiProductQuery(userText) {
   }
 }
 
+// Ejecuta varias consultas a Shopify combinando keywords y (si hay) marca
 async function searchByQueries(keywords = [], brands = [], max = 6) {
   const pool = []; const seen = new Set();
 
@@ -718,8 +687,9 @@ function scoreTitleForStock(title = '', tokens = [], brandTokens = []) {
   const t = tokenizeStrict(title);
   const set = new Set(t);
   let score = 0;
-  for (const tok of tokens) if (set.has(tok)) score += 1;
-
+  for (const tok of tokens) {
+    if (set.has(tok)) score += 1;
+  }
   for (const b of brandTokens) {
     const parts = b.split(' ');
     if (parts.every(p => set.has(p))) score += 2;
@@ -744,7 +714,9 @@ async function findHandleForStock(message = '', meta = {}) {
     if (tokens.length) {
       queries.push(tokens.join(' ') + ' ' + brand);
       queries.push(brand + ' ' + tokens.join(' '));
-    } else queries.push(brand);
+    } else {
+      queries.push(brand);
+    }
   }
   if (tokens.length) queries.push(tokens.join(' '));
 
@@ -778,13 +750,16 @@ async function findHandleForStock(message = '', meta = {}) {
 
   const list = (candidateList.length ? candidateList : scored)
     .sort((a, b) => {
-      if (a.availableForSale !== b.availableForSale) return a.availableForSale ? -1 : 1;
+      if (a.availableForSale !== b.availableForSale) {
+        return a.availableForSale ? -1 : 1;
+      }
       return b._score - a._score;
     });
 
   return list[0]?.handle || null;
 }
 
+// Formatos
 function pluralUnidad(n) { return (Number(n) === 1) ? 'unidad' : 'unidades'; }
 function pluralDisponible(n) { return (Number(n) === 1) ? 'disponible' : 'disponibles'; }
 function isDefaultVariantTitle(t = '') { return /default\s*title/i.test(String(t)); }
@@ -795,6 +770,7 @@ const PURPOSE_REGEX = /\b(para que sirve|para qué sirve|que es|qué es|como usa
 function detectIntent(text = '') {
   const q = norm(text);
 
+  // Si viene "envío <lugar>", rutear a shipping_region
   const m = String(text || '').match(/^env[ií]o\s+(.+)$/i);
   if (m) {
     const loc = fold(m[1]);
@@ -810,6 +786,7 @@ function detectIntent(text = '') {
   if (/(categorias|categorías|tipos de productos|colecciones|que productos venden|qué productos venden)/.test(q)) return 'categories';
   if (PURPOSE_REGEX.test(text)) return 'info';
 
+  // Shopping list robusto
   const commaCount = (text.match(/,/g) || []).length;
   const looksLikeRealList = /\b\w+\b\s*,\s*\b\w+\b\s*(?:,|\by\b)\s*\b\w+\b/i.test(text);
   if (/(necesito:|lista:|comprar:|quiero:)/.test(q) || commaCount >= 2 || looksLikeRealList) return 'shopping';
@@ -865,6 +842,9 @@ app.post('/chat', async (req, res) => {
     const { message, toolResult, meta = {} } = req.body;
     const FREE_TH = Number(FREE_SHIPPING_THRESHOLD_CLP ?? FREE_TH_DEFAULT);
 
+    /* ----------- POST-TOOL HANDLER ----------- */
+    // Opción B: aceptamos tanto variantId como productHandle, pero el "tool"
+    // se ejecuta en el front. Aquí solo devolvemos un mensaje amable.
     if (toolResult?.id) {
       try {
         const result = toolResult.result || {};
@@ -878,13 +858,16 @@ app.post('/chat', async (req, res) => {
       } catch (e) {
         console.warn('[ML Chat toolResult] no se pudo loguear:', e?.message || e);
       }
+
       return res.json({ text: "¡Listo! Producto agregado 👍" });
     }
 
+    // Si por algún motivo no llega message ni toolResult, responder algo neutro
     if (!message) {
       return res.json({ text: "¿En qué te ayudo? Puedo sugerirte productos, formas de uso o calcular envío por región." });
     }
 
+    /* ----------- INTENTS ----------- */
     const intent = detectIntent(message || '');
 
     /* ---- STOCK (Storefront) ---- */
@@ -896,7 +879,9 @@ app.post('/chat', async (req, res) => {
       }
 
       if (!handle) {
-        try { handle = await findHandleForStock(message || '', meta); } catch { }
+        try {
+          handle = await findHandleForStock(message || '', meta);
+        } catch { }
       }
 
       if (!handle) {
@@ -924,7 +909,9 @@ app.post('/chat', async (req, res) => {
         if (withQty.length === 1) {
           const v = withQty[0];
           const label = isDefaultVariantTitle(v.title) ? '**Stock disponible:**' : `**Variante ${v.title} — Stock:**`;
-          return res.json({ text: `${header}\n${label} ${v.quantityAvailable} ${pluralUnidad(v.quantityAvailable)}` });
+          return res.json({
+            text: `${header}\n${label} ${v.quantityAvailable} ${pluralUnidad(v.quantityAvailable)}`
+          });
         }
 
         if (withQty.length > 1) {
@@ -932,10 +919,14 @@ app.post('/chat', async (req, res) => {
             const name = isDefaultVariantTitle(v.title) ? 'Variante única' : `Variante ${v.title}`;
             return `- ${name}: ${v.quantityAvailable} ${pluralUnidad(v.quantityAvailable)}`;
           });
-          return res.json({ text: `${header}\n**Detalle por variante:**\n${lines.join('\n')}` });
+          return res.json({
+            text: `${header}\n**Detalle por variante:**\n${lines.join('\n')}`
+          });
         }
 
-        return res.json({ text: `${header}\n**Stock disponible:** ${qty} ${pluralUnidad(qty)}` });
+        return res.json({
+          text: `${header}\n**Stock disponible:** ${qty} ${pluralUnidad(qty)}`
+        });
       }
 
       const avail = info.variants.filter(v => v.available);
@@ -1043,9 +1034,8 @@ app.post('/chat', async (req, res) => {
       // si no hubo match, cae a recomendación normal
     }
 
-    /* ✅ NUEVO: IA para info/browse ahora "vende con productos" (y si no hay match, da tips) */
+    /* ---- IA para info (paso a paso) + recomendaciones — PRIORIDAD TÍTULO ---- */
     if (intent === 'info' || intent === 'browse') {
-      // 1) Buscar productos relevantes (con precio)
       let items = [];
       try {
         items = await recommendByTitleFirst(message || '', 6);
@@ -1065,6 +1055,7 @@ app.post('/chat', async (req, res) => {
       }
 
       if (!items.length) {
+        // Fallback: descripción (body)
         const bqs = bodyQueriesFromText(message || '');
         const bodyPool = await buildPoolByQueries(bqs, 72);
         const scored = bodyPool.map(p => {
@@ -1074,61 +1065,6 @@ app.post('/chat', async (req, res) => {
         items = scored.slice(0, 6);
       }
 
-      const greet = (meta?.userFirstName && meta?.tipAlreadyShown !== true && Number(meta?.cartSubtotalCLP || 0) < Number(FREE_TH || FREE_TH_DEFAULT))
-        ? `TIP: Hola, ${meta.userFirstName} 👋 | Te faltan ${fmtCLP(Number(FREE_TH || FREE_TH_DEFAULT) - Number(meta?.cartSubtotalCLP || 0))} para envío gratis en RM\n\n`
-        : '';
-
-      // 2) Si hay productos, pedirle a la IA que explique 1–2 y cómo usarlos (con precio real)
-      if (items && items.length) {
-        const topForExplain = items.slice(0, 3); // entregamos 3 para que elija 1–2
-        const contextLines = topForExplain.map((p, idx) => {
-          const price = (p.priceCLP && p.priceCLP > 0) ? fmtCLP(p.priceCLP) : 'Precio no disponible';
-          const desc = String(p.description || '').replace(/\s+/g, ' ').trim().slice(0, 320);
-          return [
-            `#${idx + 1}`,
-            `Título: ${p.title}`,
-            `Marca/Vendor: ${p.vendor || '—'}`,
-            `Tipo: ${p.productType || '—'}`,
-            `Precio: ${price}`,
-            `Descripción: ${desc || '—'}`
-          ].join('\n');
-        }).join('\n\n');
-
-        let expl = '';
-        try {
-          const ai = await openai.chat.completions.create({
-            model: 'gpt-4o-mini',
-            temperature: 0.3,
-            messages: [
-              { role: 'system', content: AI_PRODUCT_EXPLAINER },
-              { role: 'assistant', content: `Productos reales disponibles (usa SOLO estos):\n\n${contextLines}` },
-              { role: 'user', content: message || '' }
-            ]
-          });
-          expl = (ai.choices?.[0]?.message?.content || '').trim();
-        } catch (err) {
-          console.warn('[ai product explainer] fallo:', err?.message || err);
-        }
-
-        const list = `\n\n${buildProductsMarkdown(items)}`;
-        const fallbackText = `TIP: ${(
-          await openai.chat.completions.create({
-            model: 'gpt-4o-mini',
-            messages: [
-              { role: 'system', content: AI_POLICY },
-              { role: 'user', content: message || '' }
-            ]
-          }).then(r => (r.choices?.[0]?.message?.content || '').trim()).catch(() => '')
-        )}`;
-
-        const finalText = expl
-           ? `${greet}${expl}\n\nPRODUCTS:\n${items.map(p => p.handle).join('\n')}`
-           : `${greet}${fallbackText}\n\nPRODUCTS:\n${items.map(p => p.handle).join('\n')}`;
-
-        return res.json({ text: finalText });
-      }
-
-      // 3) Si no hay productos, tips genéricos (como antes)
       let tipText = '';
       try {
         const ai = await openai.chat.completions.create({
@@ -1144,7 +1080,16 @@ app.post('/chat', async (req, res) => {
         console.warn('[ai] fallo mini plan', err?.message || err);
       }
 
-      return res.json({ text: tipText || 'No encontré coincidencias exactas. ¿Me das una pista más (marca, superficie, aroma)?' });
+      const list = (items && items.length)
+        ? `\n\n${buildProductsMarkdown(items)}`
+        : '';
+
+      const greet = (meta?.userFirstName && meta?.tipAlreadyShown !== true && Number(meta?.cartSubtotalCLP || 0) < Number(FREE_TH || FREE_TH_DEFAULT))
+        ? `TIP: Hola, ${meta.userFirstName} 👋 | Te faltan ${fmtCLP(Number(FREE_TH || FREE_TH_DEFAULT) - Number(meta?.cartSubtotalCLP || 0))} para envío gratis en RM\n\n`
+        : '';
+
+      const finalText = (tipText ? `${greet}${tipText}${list}` : (list || 'No encontré coincidencias exactas. ¿Me das una pista más (marca, superficie, aroma)?'));
+      return res.json({ text: finalText });
     }
 
     return res.json({ text: "¿Me cuentas un poco más? Puedo sugerirte productos o calcular envío por región." });
