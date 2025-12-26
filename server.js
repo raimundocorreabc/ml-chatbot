@@ -155,7 +155,7 @@ const COMUNAS = ['Las Condes', 'Vitacura', 'Lo Barnechea', 'Providencia', 'Ñuñ
 const COMUNAS_F = new Set(COMUNAS.map(fold));
 
 const SHIPPING_ZONES = [
-  { zone: 'REGIÓN METROPOLITANA', cost: 3990, regions: ['Metropolitana', 'Santiago'] },
+  { zone: 'REGIÓN METROPOLITANA', cost: 4290, regions: ['Metropolitana', 'Santiago'] },
   { zone: 'ZONA CENTRAL', cost: 6990, regions: ['Coquimbo', 'Valparaíso', 'Valparaiso', "O’Higgins", "O'Higgins", 'Maule', 'Ñuble', 'Nuble', 'Biobío', 'Biobio', 'Araucanía', 'Araucania', 'Los Ríos', 'Los Rios', 'Los Lagos'] },
   { zone: 'ZONA NORTE', cost: 10990, regions: ['Arica y Parinacota', 'Tarapacá', 'Tarapaca', 'Antofagasta', 'Atacama'] },
   { zone: 'ZONA AUSTRAL', cost: 14990, regions: ['Aysén', 'Aysen', 'Magallanes'] }
@@ -991,7 +991,7 @@ app.post('/chat', async (req, res) => {
       const general = `El costo se calcula en el **checkout** según **región y comuna**. Elige tu región para ver el costo referencial:`;
       const tarifas =
         `Tarifas por zona:\n` +
-        `- **REGIÓN METROPOLITANA**: ${fmtCLP(3990)}\n` +
+        `- **REGIÓN METROPOLITANA**: ${fmtCLP(4290)}\n` +
         `- **ZONA CENTRAL**: ${fmtCLP(6990)} (Coquimbo, Valparaíso, O’Higgins, Maule, Ñuble, Biobío, Araucanía, Los Ríos, Los Lagos)\n` +
         `- **ZONA NORTE**: ${fmtCLP(10990)} (Arica y Parinacota, Tarapacá, Antofagasta, Atacama)\n` +
         `- **ZONA AUSTRAL**: ${fmtCLP(14990)} (Aysén, Magallanes)`;
