@@ -163,8 +163,8 @@ const SHIPPING_ZONES = [
 const REGION_COST_MAP = (() => {
   const m = new Map();
   for (const z of SHIPPING_ZONES) for (const r of z.regions) m.set(fold(r), { zone: z.zone, cost: z.cost });
-  m.set('metropolitana', { zone: 'REGIÓN METROPOLITANA', cost: 3990 });
-  m.set('santiago', { zone: 'REGIÓN METROPOLITANA', cost: 3990 });
+  m.set('metropolitana', { zone: 'REGIÓN METROPOLITANA', cost: 4290 });
+  m.set('santiago', { zone: 'REGIÓN METROPOLITANA', cost: 4290 });
   return m;
 })();
 const shippingByRegionName = (s = '') => REGION_COST_MAP.get(fold(s)) || null;
