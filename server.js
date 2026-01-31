@@ -239,10 +239,14 @@ async function listTopSellers(first = 8) {
 }
 
 // ✅ Ahora muestra precio + disponibilidad + mini descripción real
-function buildProductsMarkdown(items = []) {
+async function buildProductsMarkdown(items = []) {
   if (!items.length) return null;
 
-  const blocks = items.map((p, i) => {
+  const blocks = [];
+
+  for (let i = 0; i < items.length; i++) {
+    const p = items[i];
+
     const title = (p.title || 'Ver producto').replace(/\*/g, '');
     const link = `${BASE}/products/${p.handle}`;
 
@@ -255,21 +259,14 @@ function buildProductsMarkdown(items = []) {
 
     const stockLine = (p.availableForSale === false) ? 'Sin stock' : 'Disponible';
 
-    const desc = String(p.description || '')
-      .replace(/\s+/g, ' ')
-      .trim()
-      .slice(0, 140);
-    const descLine = desc ? `${desc}${desc.length >= 140 ? '…' : ''}` : '';
+    const summary = await summarizeProductDescription(p.title, p.description);
 
-    // Bloque SIN numeración markdown "1." y SIN indentación
-    // (esto evita que el renderer se coma el título y deje solo la 📝)
-    return [
-      `🧴 ${i + 1}) ${title}`,
-      priceLine ? `💰 ${priceLine} · ${stockLine}` : `📦 ${stockLine}`,
-      `🔗 ${link}`,
-      descLine ? `📝 ${descLine}` : null
-    ].filter(Boolean).join('\n');
-  });
+    blocks.push([
+      `🧴 ${i + 1}) **[${title}](${link})**`,
+      priceLine ? `💰 **${priceLine}** · ${stockLine}` : `📦 ${stockLine}`,
+      summary
+    ].filter(Boolean).join('\n'));
+  }
 
   return `🧴 Productos recomendados (datos reales):\n\n${blocks.join('\n\n—\n\n')}`;
 }
@@ -1090,7 +1087,7 @@ app.post('/chat', async (req, res) => {
     if (intent === 'tops') {
       const items = await listTopSellers(10).then(xs => preferInStock(xs, 8));
       if (!items.length) return res.json({ text: "Por ahora no tengo un ranking de más vendidos." });
-      return res.json({ text: buildProductsMarkdown(items) });
+      return res.json({ text: await buildProductsMarkdown(items) });
     }
 
     /* ---- Marcas (BRANDS chips) ---- */
@@ -1173,7 +1170,8 @@ app.post('/chat', async (req, res) => {
     if (intent === 'shopping') {
       const picks = await selectProductsByOrderedKeywords(message || '');
       if (picks && picks.length) {
-        return res.json({ text: `Te dejo una opción por ítem (con precio y descripción real):\n\n${buildProductsMarkdown(picks)}` });
+        return res.json({text: `Te dejo una opción por ítem (con precio y descripción real):\n\n${await buildProductsMarkdown(picks)}`});
+
       }
       // si no hubo match, cae a recomendación normal
     }
@@ -1224,7 +1222,7 @@ app.post('/chat', async (req, res) => {
         console.warn('[ai] fallo mini plan', err?.message || err);
       }
 
-      const productsBlock = (items && items.length) ? buildProductsMarkdown(items) : '';
+      const productsBlock = (items && items.length) ? await buildProductsMarkdown(items) : '';
 
       const greetLine =
         (meta?.userFirstName && meta?.tipAlreadyShown !== true && Number(meta?.cartSubtotalCLP || 0) < Number(FREE_TH || FREE_TH_DEFAULT))
