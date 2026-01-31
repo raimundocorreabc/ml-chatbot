@@ -77,6 +77,69 @@ async function gql(query, variables = {}) {
 }
 
 /* ----- Catálogo helpers ----- */
+
+/* ===== Resumen inteligente de descripción (Modo de uso / Dónde usar / Qué hace) ===== */
+const AI_DESC_SUMMARY = `
+Eres un asistente de e-commerce (Chile) para productos de limpieza.
+Te daré el título y la descripción HTML/texto de un producto.
+
+Devuelve SOLO un texto corto en español, en 2 a 4 líneas con este formato:
+
+🧽 ¿Para qué sirve?: ...
+📍 ¿Dónde lo puedo usar?: ...
+✨ ¿Qué lo hace mejor?: ...
+🧴 Modo de uso: ...
+
+Reglas:
+- Si no hay info para una línea, omítela.
+- No inventes datos que no estén en el texto.
+- No uses links.
+- Máximo 240 caracteres por línea.
+`;
+
+function stripHtml(s = '') {
+  return String(s || '')
+    .replace(/<script[\s\S]*?>[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<style[\s\S]*?>[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<\/?[^>]+>/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+async function summarizeProductDescription(title = '', description = '') {
+  const clean = stripHtml(description);
+
+  // Si viene muy corta, devolvemos una mini línea simple (sin IA)
+  if (!clean || clean.length < 40) {
+    return clean ? `📝 ${clean.slice(0, 200)}${clean.length > 200 ? '…' : ''}` : '';
+  }
+
+  // Para costos/latencia: limitamos input
+  const input = `TÍTULO:\n${String(title).slice(0, 120)}\n\nDESCRIPCIÓN:\n${clean.slice(0, 1200)}`;
+
+  try {
+    const ai = await openai.chat.completions.create({
+      model: 'gpt-4o-mini',
+      temperature: 0.2,
+      messages: [
+        { role: 'system', content: AI_DESC_SUMMARY },
+        { role: 'user', content: input }
+      ]
+    });
+
+    const out = (ai.choices?.[0]?.message?.content || '').trim();
+
+    // aseguramos que venga algo util
+    if (!out) return `📝 ${clean.slice(0, 220)}${clean.length > 220 ? '…' : ''}`;
+
+    return out;
+  } catch (e) {
+    console.warn('[summarizeProductDescription] error:', e?.message || e);
+    return `📝 ${clean.slice(0, 220)}${clean.length > 220 ? '…' : ''}`;
+  }
+}
+
+
 async function listCollections(limit = 10) {
   const d = await gql(`
     query($n:Int!){ collections(first:$n){ edges{ node{ title handle } } } }
