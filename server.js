@@ -1,6 +1,7 @@
 // server.js — IA-first + catálogo/brands/envíos/regiones/shopping-list + IA→keywords→Shopify + STOCK
 // Lógica de ranking: TÍTULO > DESCRIPCIÓN (empate) > DESCRIPCIÓN (si no hay hits en título)
 // Mejora: stemming simétrico, sinónimos pods/cápsulas, bonus para pods, sin penalizar packs.
+// ✅ Cambio clave: cuando recomendamos productos, traemos y mostramos datos reales (precio, compare-at, imagen opcional, descripción corta).
 
 import 'dotenv/config';
 import express from 'express';
@@ -48,7 +49,19 @@ const FREE_TH_DEFAULT = 40000;
 
 const norm = s => String(s || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
 const fold = s => norm(s).replace(/ñ/g, 'n');
+
+// CLP “bonito”, y fallback si moneda no es CLP
 const fmtCLP = n => new Intl.NumberFormat('es-CL', { style: 'currency', currency: 'CLP', maximumFractionDigits: 0 }).format(Math.round(Number(n) || 0));
+function fmtMoney(amount, currencyCode = 'CLP') {
+  const a = Number(amount);
+  if (!Number.isFinite(a)) return '';
+  if (String(currencyCode).toUpperCase() === 'CLP') return fmtCLP(a);
+  try {
+    return new Intl.NumberFormat('es-CL', { style: 'currency', currency: currencyCode, maximumFractionDigits: 2 }).format(a);
+  } catch {
+    return `${a} ${currencyCode}`;
+  }
+}
 
 async function gql(query, variables = {}) {
   const url = `https://${SHOPIFY_STORE_DOMAIN}/api/${SF_API_VERSION}/graphql.json`;
@@ -71,30 +84,55 @@ async function listCollections(limit = 10) {
   return (d.collections?.edges || []).map(e => ({ title: e.node.title, handle: e.node.handle }));
 }
 
+// ✅ Ahora trae precio/compareAt/imagen + descripción (para responder con info real)
 async function searchProductsPlain(query, first = 5) {
   // Pedimos vendor, productType, tags y description para poder puntuar por "descripción"
+  // + precios e imagen para mostrar info real al usuario
   const d = await gql(`
     query($q:String!,$n:Int!){
       search(query:$q, types: PRODUCT, first:$n){
         edges{ node{
           ... on Product {
-            title handle availableForSale vendor productType tags description
+            title
+            handle
+            availableForSale
+            vendor
+            productType
+            tags
+            description
+            featuredImage { url altText }
+            priceRange { minVariantPrice { amount currencyCode } }
+            compareAtPriceRange { minVariantPrice { amount currencyCode } }
           }
         } }
       }
     }
   `, { q: query, n: first });
-  return (d.search?.edges || []).map(e => ({
-    title: e.node.title,
-    handle: e.node.handle,
-    availableForSale: !!e.node.availableForSale,
-    vendor: e.node.vendor || '',
-    productType: e.node.productType || '',
-    tags: Array.isArray(e.node.tags) ? e.node.tags : [],
-    description: e.node.description || ''
-  }));
+
+  return (d.search?.edges || []).map(e => {
+    const p = e.node || {};
+    const price = p.priceRange?.minVariantPrice?.amount ?? null;
+    const currency = p.priceRange?.minVariantPrice?.currencyCode ?? 'CLP';
+    const compareAt = p.compareAtPriceRange?.minVariantPrice?.amount ?? null;
+    const compareCurrency = p.compareAtPriceRange?.minVariantPrice?.currencyCode ?? currency;
+    return {
+      title: p.title,
+      handle: p.handle,
+      availableForSale: !!p.availableForSale,
+      vendor: p.vendor || '',
+      productType: p.productType || '',
+      tags: Array.isArray(p.tags) ? p.tags : [],
+      description: p.description || '',
+      imageUrl: p.featuredImage?.url || '',
+      price,
+      currency,
+      compareAt,
+      compareCurrency
+    };
+  });
 }
 
+// ✅ Top sellers ahora también trae precio real (si se usa colección o global)
 async function listTopSellers(first = 8) {
   const handle = (BEST_SELLERS_COLLECTION_HANDLE || '').trim();
   if (handle) {
@@ -103,31 +141,136 @@ async function listTopSellers(first = 8) {
         query($h:String!,$n:Int!){
           collectionByHandle(handle:$h){
             products(first:$n, sortKey: BEST_SELLING){
-              edges{ node{ title handle availableForSale } }
+              edges{ node{
+                title
+                handle
+                availableForSale
+                featuredImage { url altText }
+                priceRange { minVariantPrice { amount currencyCode } }
+                compareAtPriceRange { minVariantPrice { amount currencyCode } }
+                description
+              } }
             }
           }
         }
       `, { h: handle, n: first });
-      const items = (d.collectionByHandle?.products?.edges || []).map(e => ({ title: e.node.title, handle: e.node.handle, availableForSale: !!e.node.availableForSale }));
+
+      const items = (d.collectionByHandle?.products?.edges || []).map(e => {
+        const p = e.node;
+        return ({
+          title: p.title,
+          handle: p.handle,
+          availableForSale: !!p.availableForSale,
+          imageUrl: p.featuredImage?.url || '',
+          description: p.description || '',
+          price: p.priceRange?.minVariantPrice?.amount ?? null,
+          currency: p.priceRange?.minVariantPrice?.currencyCode ?? 'CLP',
+          compareAt: p.compareAtPriceRange?.minVariantPrice?.amount ?? null,
+          compareCurrency: p.compareAtPriceRange?.minVariantPrice?.currencyCode ?? (p.priceRange?.minVariantPrice?.currencyCode ?? 'CLP'),
+        });
+      });
+
       if (items.length) return items;
       console.warn('[tops] Colección vacía o inválida:', handle);
     } catch (err) { console.warn('[tops] error colección', err?.message || err); }
   }
+
   try {
     const d = await gql(`
-      query($n:Int!){ products(first:$n, sortKey: BEST_SELLING){ edges{ node{ title handle availableForSale } } } }
+      query($n:Int!){
+        products(first:$n, sortKey: BEST_SELLING){
+          edges{ node{
+            title handle availableForSale
+            featuredImage { url altText }
+            priceRange { minVariantPrice { amount currencyCode } }
+            compareAtPriceRange { minVariantPrice { amount currencyCode } }
+            description
+          } }
+        }
+      }
     `, { n: first });
-    const items = (d.products?.edges || []).map(e => ({ title: e.node.title, handle: e.node.handle, availableForSale: !!e.node.availableForSale }));
+
+    const items = (d.products?.edges || []).map(e => {
+      const p = e.node;
+      return ({
+        title: p.title,
+        handle: p.handle,
+        availableForSale: !!p.availableForSale,
+        imageUrl: p.featuredImage?.url || '',
+        description: p.description || '',
+        price: p.priceRange?.minVariantPrice?.amount ?? null,
+        currency: p.priceRange?.minVariantPrice?.currencyCode ?? 'CLP',
+        compareAt: p.compareAtPriceRange?.minVariantPrice?.amount ?? null,
+        compareCurrency: p.compareAtPriceRange?.minVariantPrice?.currencyCode ?? (p.priceRange?.minVariantPrice?.currencyCode ?? 'CLP'),
+      });
+    });
+
     if (items.length) return items;
   } catch (err) { console.warn('[tops] error global', err?.message || err); }
-  const any = await gql(`query($n:Int!){ products(first:$n){ edges{ node{ title handle availableForSale } } } }`, { n: first });
-  return (any.products?.edges || []).map(e => ({ title: e.node.title, handle: e.node.handle, availableForSale: !!e.node.availableForSale }));
+
+  const any = await gql(`
+    query($n:Int!){
+      products(first:$n){
+        edges{ node{
+          title handle availableForSale
+          featuredImage { url altText }
+          priceRange { minVariantPrice { amount currencyCode } }
+          compareAtPriceRange { minVariantPrice { amount currencyCode } }
+          description
+        } }
+      }
+    }
+  `, { n: first });
+
+  return (any.products?.edges || []).map(e => {
+    const p = e.node;
+    return ({
+      title: p.title,
+      handle: p.handle,
+      availableForSale: !!p.availableForSale,
+      imageUrl: p.featuredImage?.url || '',
+      description: p.description || '',
+      price: p.priceRange?.minVariantPrice?.amount ?? null,
+      currency: p.priceRange?.minVariantPrice?.currencyCode ?? 'CLP',
+      compareAt: p.compareAtPriceRange?.minVariantPrice?.amount ?? null,
+      compareCurrency: p.compareAtPriceRange?.minVariantPrice?.currencyCode ?? (p.priceRange?.minVariantPrice?.currencyCode ?? 'CLP'),
+    });
+  });
 }
 
+// ✅ Ahora muestra precio + disponibilidad + mini descripción real
 function buildProductsMarkdown(items = []) {
   if (!items.length) return null;
-  const lines = items.map((p, i) => `${i + 1}. **[${(p.title || 'Ver producto').replace(/\*/g, '')}](${BASE}/products/${p.handle})**`);
-  return `Aquí tienes opciones:\n\n${lines.join('\n')}`;
+
+  const lines = items.map((p, i) => {
+    const title = (p.title || 'Ver producto').replace(/\*/g, '');
+    const link = `${BASE}/products/${p.handle}`;
+
+    // precio
+    const priceTxt = (p.price != null)
+      ? fmtMoney(p.price, p.currency)
+      : '';
+
+    const compareTxt = (p.compareAt != null && Number(p.compareAt) > Number(p.price || 0))
+      ? ` (antes ${fmtMoney(p.compareAt, p.compareCurrency || p.currency)})`
+      : '';
+
+    const stockTxt = (p.availableForSale === false) ? ' — **sin stock**' : '';
+
+    // descripción corta
+    const desc = String(p.description || '')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, 140);
+
+    const descTxt = desc ? `\n   _${desc}${desc.length >= 140 ? '…' : ''}_` : '';
+
+    const priceLine = priceTxt ? ` — **${priceTxt}**${compareTxt}` : '';
+
+    return `${i + 1}. **[${title}](${link})**${priceLine}${stockTxt}${descTxt}`;
+  });
+
+  return `Aquí tienes opciones (datos reales de la tienda):\n\n${lines.join('\n')}`;
 }
 
 async function preferInStock(items, need) {
@@ -209,7 +352,6 @@ const KNOWN_BRANDS = [
 ];
 
 const GENERIC_TOKENS = new Set(['limpiar', 'limpieza', 'especialista', 'spray', 'gatillo', 'hogar', 'casa'].map(norm));
-
 const SHORT_TOKENS_WHITELIST = new Set(['wc', 'ph', 'kh7', '3en1', '3 en 1', 'pc', 'tv'].map(norm));
 
 /* ---------- Token helpers (stemming simétrico) ---------- */
@@ -1029,7 +1171,7 @@ app.post('/chat', async (req, res) => {
     if (intent === 'shopping') {
       const picks = await selectProductsByOrderedKeywords(message || '');
       if (picks && picks.length) {
-        return res.json({ text: `Te dejo una opción por ítem:\n\n${buildProductsMarkdown(picks)}` });
+        return res.json({ text: `Te dejo una opción por ítem (con precio y descripción real):\n\n${buildProductsMarkdown(picks)}` });
       }
       // si no hubo match, cae a recomendación normal
     }
@@ -1104,3 +1246,4 @@ app.post('/chat', async (req, res) => {
 app.get('/health', (_, res) => res.json({ ok: true }));
 const port = PORT || process.env.PORT || 3000;
 app.listen(port, () => console.log('ML Chat server on :' + port));
+
