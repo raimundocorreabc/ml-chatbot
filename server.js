@@ -242,36 +242,38 @@ async function listTopSellers(first = 8) {
 function buildProductsMarkdown(items = []) {
   if (!items.length) return null;
 
-  const lines = items.map((p, i) => {
+  const blocks = items.map((p, i) => {
     const title = (p.title || 'Ver producto').replace(/\*/g, '');
     const link = `${BASE}/products/${p.handle}`;
 
-    // precio
-    const priceTxt = (p.price != null)
-      ? fmtMoney(p.price, p.currency)
-      : '';
+    const priceTxt = (p.price != null) ? fmtMoney(p.price, p.currency) : '';
+    const compareTxt =
+      (p.compareAt != null && Number(p.compareAt) > Number(p.price ?? 0))
+        ? ` (antes ${fmtMoney(p.compareAt, p.compareCurrency || p.currency)})`
+        : '';
+    const priceLine = priceTxt ? `${priceTxt}${compareTxt}` : '';
 
-    const compareTxt = (p.compareAt != null && Number(p.compareAt) > Number(p.price || 0))
-      ? ` (antes ${fmtMoney(p.compareAt, p.compareCurrency || p.currency)})`
-      : '';
+    const stockLine = (p.availableForSale === false) ? 'Sin stock' : 'Disponible';
 
-    const stockTxt = (p.availableForSale === false) ? ' — **sin stock**' : '';
-
-    // descripción corta
     const desc = String(p.description || '')
       .replace(/\s+/g, ' ')
       .trim()
       .slice(0, 140);
+    const descLine = desc ? `${desc}${desc.length >= 140 ? '…' : ''}` : '';
 
-    const descTxt = desc ? `\n   📝 ${desc}${desc.length >= 140 ? '…' : ''}` : '';
-
-    const priceLine = priceTxt ? ` — **${priceTxt}**${compareTxt}` : '';
-
-    return `${i + 1}. **[${title}](${link})**${priceLine}${stockTxt}${descTxt}`;
+    // Bloque SIN numeración markdown "1." y SIN indentación
+    // (esto evita que el renderer se coma el título y deje solo la 📝)
+    return [
+      `🧴 ${i + 1}) ${title}`,
+      priceLine ? `💰 ${priceLine} · ${stockLine}` : `📦 ${stockLine}`,
+      `🔗 ${link}`,
+      descLine ? `📝 ${descLine}` : null
+    ].filter(Boolean).join('\n');
   });
 
-  return `🧴 Productos recomendados (datos reales):\n\n${lines.join('\n\n')}`;
+  return `🧴 Productos recomendados (datos reales):\n\n${blocks.join('\n\n—\n\n')}`;
 }
+
 
 async function preferInStock(items, need) {
   const inStock = items.filter(x => x.availableForSale);
