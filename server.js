@@ -302,6 +302,7 @@ async function listTopSellers(first = 8) {
 }
 
 // ✅ Ahora muestra precio + disponibilidad + mini descripción real
+// ✅ Ahora muestra nombre SIEMPRE (texto plano) + precio + stock + resumen IA
 async function buildProductsMarkdown(items = []) {
   if (!items.length) return null;
 
@@ -310,7 +311,7 @@ async function buildProductsMarkdown(items = []) {
   for (let i = 0; i < items.length; i++) {
     const p = items[i];
 
-    const title = (p.title || 'Ver producto').replace(/\*/g, '');
+    const title = String(p.title || 'Ver producto').replace(/\*/g, '').trim();
     const link = `${BASE}/products/${p.handle}`;
 
     const priceTxt = (p.price != null) ? fmtMoney(p.price, p.currency) : '';
@@ -322,10 +323,12 @@ async function buildProductsMarkdown(items = []) {
 
     const stockLine = (p.availableForSale === false) ? 'Sin stock' : 'Disponible';
 
-    const summary = await summarizeProductDescription(p.title, p.description);
+    const summary = await summarizeProductDescription(title, p.description);
 
+    // ⚠️ IMPORTANTE: nombre en texto plano (no markdown link), así no se “pierde”
     blocks.push([
-      `🧴 ${i + 1}) **[${title}](${link})**`,
+      `🧴 ${i + 1}) ${title}`,
+      `🔗 ${link}`,
       priceLine ? `💰 **${priceLine}** · ${stockLine}` : `📦 ${stockLine}`,
       summary
     ].filter(Boolean).join('\n'));
@@ -333,6 +336,7 @@ async function buildProductsMarkdown(items = []) {
 
   return `🧴 Productos recomendados (datos reales):\n\n${blocks.join('\n\n—\n\n')}`;
 }
+
 
 
 async function preferInStock(items, need) {
