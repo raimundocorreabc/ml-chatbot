@@ -1276,19 +1276,53 @@ app.post('/chat', async (req, res) => {
 
       let tipText = '';
       try {
+        // Elegimos 1 candidato "estrella" para meterlo en el TIP si calza perfecto
+        const topPick = (items && items.length) ? items[0] : null;
+      
+        // Contexto compacto y limpio (SIN indentación basura)
+        const productContext = topPick
+          ? [
+              'PRODUCTO TOP EN TIENDA:',
+              `- title: ${topPick.title || ''}`,
+              `- price: ${topPick.price != null ? fmtMoney(topPick.price, topPick.currency) : ''}`,
+              `- compareAt: ${topPick.compareAt != null ? fmtMoney(topPick.compareAt, topPick.compareCurrency || topPick.currency) : ''}`,
+              `- availableForSale: ${topPick.availableForSale ? 'true' : 'false'}`,
+              `- handle: ${topPick.handle || ''}`,
+              `- description: ${(topPick.description || '').replace(/\s+/g, ' ').trim().slice(0, 600)}`
+            ].join('\n')
+          : 'SIN PRODUCTO TOP';
+      
+        const AI_POLICY_WITH_PRODUCTS = `
+        Eres el asistente de MundoLimpio.cl (Chile), experto en limpieza.
+        
+        Objetivo:
+        - Responde con 3–5 bullets (pasos claros y seguros).
+        - Si hay un PRODUCTO TOP y es claramente relevante para la pregunta, menciónalo SOLO UNA VEZ dentro de los bullets usando este formato:
+          "✅ En MundoLimpio tenemos: <NOMBRE> — sirve para <uso principal>."
+        - Si el producto NO es relevante, NO lo menciones.
+        - No pongas links, CTAs ni precios en el TIP.
+        - No inventes superficies, usos ni claims.
+        - Si el usuario pregunta "¿venden X?" y el PRODUCTO TOP coincide, responde "Sí" de forma directa.
+        
+        Datos disponibles:
+        ${productContext}
+        `;
+      
         const ai = await openai.chat.completions.create({
           model: 'gpt-4o-mini',
+          temperature: 0.2,
           messages: [
-            { role: 'system', content: AI_POLICY },
-            { role: 'user', content: message || '' }
+            { role: 'system', content: AI_POLICY_WITH_PRODUCTS },
+            { role: 'user', content: String(message || '').slice(0, 700) }
           ]
         });
+      
         const out = (ai.choices?.[0]?.message?.content || '').trim();
         if (out) tipText = out;
       } catch (err) {
         console.warn('[ai] fallo mini plan', err?.message || err);
       }
-
+      
       const productsBlock = (items && items.length) ? await buildProductsMarkdown(items) : '';
 
       const greetLine =
