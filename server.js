@@ -263,14 +263,14 @@ function buildProductsMarkdown(items = []) {
       .trim()
       .slice(0, 140);
 
-    const descTxt = desc ? `\n   _${desc}${desc.length >= 140 ? '…' : ''}_` : '';
+    const descTxt = desc ? `\n   📝 ${desc}${desc.length >= 140 ? '…' : ''}` : '';
 
     const priceLine = priceTxt ? ` — **${priceTxt}**${compareTxt}` : '';
 
     return `${i + 1}. **[${title}](${link})**${priceLine}${stockTxt}${descTxt}`;
   });
 
-  return `Aquí tienes opciones (datos reales de la tienda):\n\n${lines.join('\n')}`;
+  return `🧴 Productos recomendados (datos reales):\n\n${lines.join('\n\n')}`;
 }
 
 async function preferInStock(items, need) {
@@ -1217,21 +1217,28 @@ app.post('/chat', async (req, res) => {
           ]
         });
         const out = (ai.choices?.[0]?.message?.content || '').trim();
-        if (out) tipText = `TIP: ${out}`;
+        if (out) tipText = out;
       } catch (err) {
         console.warn('[ai] fallo mini plan', err?.message || err);
       }
 
-      const list = (items && items.length)
-        ? `\n\n${buildProductsMarkdown(items)}`
+      const productsBlock = (items && items.length) ? buildProductsMarkdown(items) : '';
+
+      const greetLine =
+        (meta?.userFirstName && meta?.tipAlreadyShown !== true && Number(meta?.cartSubtotalCLP || 0) < Number(FREE_TH || FREE_TH_DEFAULT))
+        ? `Hola, ${meta.userFirstName} 👋 | Te faltan ${fmtCLP(Number(FREE_TH || FREE_TH_DEFAULT) - Number(meta?.cartSubtotalCLP || 0))} para envío gratis en RM.`
         : '';
 
-      const greet = (meta?.userFirstName && meta?.tipAlreadyShown !== true && Number(meta?.cartSubtotalCLP || 0) < Number(FREE_TH || FREE_TH_DEFAULT))
-        ? `TIP: Hola, ${meta.userFirstName} 👋 | Te faltan ${fmtCLP(Number(FREE_TH || FREE_TH_DEFAULT) - Number(meta?.cartSubtotalCLP || 0))} para envío gratis en RM\n\n`
-        : '';
+      const tipBlock = (greetLine || tipText)
+         ? `TIP:\n${[greetLine, tipText].filter(Boolean).join('\n')}`
+         : '';
 
-      const finalText = (tipText ? `${greet}${tipText}${list}` : (list || 'No encontré coincidencias exactas. ¿Me das una pista más (marca, superficie, aroma)?'));
-      return res.json({ text: finalText });
+      const finalText = [tipBlock, productsBlock].filter(Boolean).join('\n\n');
+
+      return res.json({
+        text: finalText || 'No encontré coincidencias exactas. ¿Me das una pista más (marca, superficie, aroma)?'
+      });
+
     }
 
     return res.json({ text: "¿Me cuentas un poco más? Puedo sugerirte productos o calcular envío por región." });
