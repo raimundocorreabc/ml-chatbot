@@ -34,28 +34,20 @@ if (!SHOPIFY_PUBLIC_STORE_DOMAIN) throw new Error("Falta SHOPIFY_PUBLIC_STORE_DO
 const app = express();
 app.use(express.json({ limit: '1.5mb' }));
 
-// ---------- CORS FIX ----------
+// ---------- CORS FIX (robusto + preflight) ----------
 const allowed = (ALLOWED_ORIGINS || '')
   .split(',')
   .map(s => s.trim())
   .filter(Boolean)
   .map(s => s.replace(/\/$/, '')); // quita slash final
 
-const clean = s => String(s || '').replace(/\/$/, '');
-
-// ---------- CORS FIX (robusto para preflight con headers extras) ----------
-const allowed = (ALLOWED_ORIGINS || '')
-  .split(',')
-  .map(s => s.trim())
-  .filter(Boolean)
-  .map(s => s.replace(/\/$/, ''));
-
-const clean = s => String(s || '').replace(/\/$/, '');
+const cleanOrigin = (s) => String(s || '').replace(/\/$/, '');
 
 const corsOptions = {
   origin: (origin, cb) => {
     if (!origin) return cb(null, true); // curl/health/etc
-    if (allowed.includes(clean(origin))) return cb(null, true);
+    const o = cleanOrigin(origin);
+    if (allowed.includes(o)) return cb(null, true);
     return cb(new Error('Origen no permitido: ' + origin));
   },
   credentials: true,
@@ -66,7 +58,6 @@ app.use(cors(corsOptions));
 app.options('*', cors(corsOptions));
 // ---------- /CORS FIX ----------
 
-// ---------- /CORS FIX ----------
 
 
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
