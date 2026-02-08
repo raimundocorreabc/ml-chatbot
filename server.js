@@ -7,6 +7,8 @@ import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
 import OpenAI from 'openai';
+import fetch from 'node-fetch';
+
 
 const {
   OPENAI_API_KEY,
@@ -34,29 +36,36 @@ if (!SHOPIFY_PUBLIC_STORE_DOMAIN) throw new Error("Falta SHOPIFY_PUBLIC_STORE_DO
 const app = express();
 app.use(express.json({ limit: '1.5mb' }));
 
-// ---------- CORS FIX (robusto + preflight) ----------
+
+// ---------- CORS (FIX definitivo) ----------
 const allowed = (ALLOWED_ORIGINS || '')
   .split(',')
   .map(s => s.trim())
   .filter(Boolean)
-  .map(s => s.replace(/\/$/, '')); // quita slash final
+  .map(s => s.replace(/\/$/, ''));
 
-const cleanOrigin = (s) => String(s || '').replace(/\/$/, '');
+function cleanOrigin(origin) {
+  return String(origin || '').replace(/\/$/, '');
+}
 
 const corsOptions = {
   origin: (origin, cb) => {
-    if (!origin) return cb(null, true); // curl/health/etc
+    if (!origin) return cb(null, true); // health checks / curl
     const o = cleanOrigin(origin);
     if (allowed.includes(o)) return cb(null, true);
-    return cb(new Error('Origen no permitido: ' + origin));
+    return cb(null, false); // <- importante: NO tirar Error acá
   },
-  credentials: true,
+  methods: ['GET', 'POST', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+  credentials: false,          // <- importante para simplificar preflight
   optionsSuccessStatus: 204
 };
 
+// Aplica CORS a todo
 app.use(cors(corsOptions));
+// Responde preflight SIEMPRE
 app.options('*', cors(corsOptions));
-// ---------- /CORS FIX ----------
+// ---------- /CORS ----------
 
 
 
