@@ -37,35 +37,47 @@ const app = express();
 app.use(express.json({ limit: '1.5mb' }));
 
 
-// ---------- CORS (FIX definitivo) ----------
+// ---------- CORS (robusto Shopify + scripts que agregan headers) ----------
 const allowed = (ALLOWED_ORIGINS || '')
   .split(',')
   .map(s => s.trim())
   .filter(Boolean)
   .map(s => s.replace(/\/$/, ''));
 
-function cleanOrigin(origin) {
-  return String(origin || '').replace(/\/$/, '');
-}
+const allowByDomain = (origin) => {
+  // Permite mundolimpio.cl con o sin www
+  try {
+    const u = new URL(origin);
+    return u.hostname === 'mundolimpio.cl' || u.hostname === 'www.mundolimpio.cl';
+  } catch {
+    return false;
+  }
+};
 
 const corsOptions = {
   origin: (origin, cb) => {
-    if (!origin) return cb(null, true); // health checks / curl
-    const o = cleanOrigin(origin);
+    if (!origin) return cb(null, true); // health checks / server-to-server
+
+    const o = String(origin).replace(/\/$/, '');
+
+    // 1) Match por lista (si la usas)
     if (allowed.includes(o)) return cb(null, true);
-    return cb(null, false); // <- importante: NO tirar Error acá
+
+    // 2) Match por dominio (más robusto en Shopify)
+    if (allowByDomain(o)) return cb(null, true);
+
+    // Bloquea el resto (sin tirar Error para no romper preflight feo)
+    return cb(null, false);
   },
-  methods: ['GET', 'POST', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
-  credentials: false,          // <- importante para simplificar preflight
+  // No fijes allowedHeaders: deja que CORS refleje lo que pide el preflight
+  credentials: false,
   optionsSuccessStatus: 204
 };
 
-// Aplica CORS a todo
 app.use(cors(corsOptions));
-// Responde preflight SIEMPRE
 app.options('*', cors(corsOptions));
 // ---------- /CORS ----------
+
 
 
 
