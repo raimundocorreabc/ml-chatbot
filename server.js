@@ -43,24 +43,29 @@ const allowed = (ALLOWED_ORIGINS || '')
 
 const clean = s => String(s || '').replace(/\/$/, '');
 
-app.use(cors({
+// ---------- CORS FIX (robusto para preflight con headers extras) ----------
+const allowed = (ALLOWED_ORIGINS || '')
+  .split(',')
+  .map(s => s.trim())
+  .filter(Boolean)
+  .map(s => s.replace(/\/$/, ''));
+
+const clean = s => String(s || '').replace(/\/$/, '');
+
+const corsOptions = {
   origin: (origin, cb) => {
-    // Permite requests sin Origin (curl, server-to-server, health)
-    if (!origin) return cb(null, true);
-
-    if (allowed.includes(clean(origin))) {
-      return cb(null, true);
-    }
-
+    if (!origin) return cb(null, true); // curl/health/etc
+    if (allowed.includes(clean(origin))) return cb(null, true);
     return cb(new Error('Origen no permitido: ' + origin));
   },
   credentials: true,
-  methods: ['GET', 'POST', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization']
-}));
+  optionsSuccessStatus: 204
+};
 
-// RESPONDER PREFLIGHT (CLAVE)
-app.options('*', cors());
+app.use(cors(corsOptions));
+app.options('*', cors(corsOptions));
+// ---------- /CORS FIX ----------
+
 // ---------- /CORS FIX ----------
 
 
