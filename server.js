@@ -34,11 +34,35 @@ if (!SHOPIFY_PUBLIC_STORE_DOMAIN) throw new Error("Falta SHOPIFY_PUBLIC_STORE_DO
 const app = express();
 app.use(express.json({ limit: '1.5mb' }));
 
-const allowed = (ALLOWED_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean);
+// ---------- CORS FIX ----------
+const allowed = (ALLOWED_ORIGINS || '')
+  .split(',')
+  .map(s => s.trim())
+  .filter(Boolean)
+  .map(s => s.replace(/\/$/, '')); // quita slash final
+
+const clean = s => String(s || '').replace(/\/$/, '');
+
 app.use(cors({
-  origin: (origin, cb) => (!origin || allowed.includes(origin)) ? cb(null, true) : cb(new Error('Origen no permitido')),
-  credentials: true
+  origin: (origin, cb) => {
+    // Permite requests sin Origin (curl, server-to-server, health)
+    if (!origin) return cb(null, true);
+
+    if (allowed.includes(clean(origin))) {
+      return cb(null, true);
+    }
+
+    return cb(new Error('Origen no permitido: ' + origin));
+  },
+  credentials: true,
+  methods: ['GET', 'POST', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization']
 }));
+
+// RESPONDER PREFLIGHT (CLAVE)
+app.options('*', cors());
+// ---------- /CORS FIX ----------
+
 
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 
